@@ -48,6 +48,9 @@ hermit-abi = { version = "0.3.0", features = ['rustc-dep-of-std'] }
 [target.wasm32-wasi.dependencies]
 wasi = { version = "0.11.0", features = ['rustc-dep-of-std'], default-features = false }
 
+[target.wasm32-wasi-threads.dependencies]
+wasi = { version = "0.11.0", features = ['rustc-dep-of-std'], default-features = false }
+
 [features]
 backtrace = [
   "gimli-symbolize",

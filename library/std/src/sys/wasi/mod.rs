@@ -29,8 +29,17 @@ pub mod fs;
 #[path = "../wasm/atomics/futex.rs"]
 pub mod futex;
 pub mod io;
-#[path = "../unsupported/locks/mod.rs"]
-pub mod locks;
+#[path = "../unix/locks"]
+pub mod locks {
+    #![allow(unsafe_op_in_unsafe_fn)]
+    mod futex_condvar;
+    mod futex_mutex;
+    mod futex_rwlock;
+    pub(crate) use futex_condvar::Condvar;
+    pub(crate) use futex_mutex::Mutex;
+    pub(crate) use futex_rwlock::RwLock;
+}
+
 pub mod net;
 pub mod os;
 #[path = "../unix/os_str.rs"]
@@ -47,8 +56,6 @@ pub mod thread;
 pub mod thread_local_dtor;
 #[path = "../unsupported/thread_local_key.rs"]
 pub mod thread_local_key;
-#[path = "../unsupported/thread_parking.rs"]
-pub mod thread_parking;
 pub mod time;
 
 cfg_if::cfg_if! {
@@ -109,4 +116,9 @@ pub fn hashmap_random_keys() -> (u64, u64) {
 
 fn err2io(err: wasi::Errno) -> std_io::Error {
     std_io::Error::from_raw_os_error(err.raw().into())
+}
+
+#[allow(dead_code)] // Not used on all platforms.
+pub fn cvt_nz(error: libc::c_int) -> crate::io::Result<()> {
+    if error == 0 { Ok(()) } else { Err(crate::io::Error::from_raw_os_error(error)) }
 }
