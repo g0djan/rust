@@ -117,8 +117,3 @@ pub fn hashmap_random_keys() -> (u64, u64) {
 fn err2io(err: wasi::Errno) -> std_io::Error {
     std_io::Error::from_raw_os_error(err.raw().into())
 }
-
-#[allow(dead_code)] // Not used on all platforms.
-pub fn cvt_nz(error: libc::c_int) -> crate::io::Result<()> {
-    if error == 0 { Ok(()) } else { Err(crate::io::Error::from_raw_os_error(error)) }
-}
