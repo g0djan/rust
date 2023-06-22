@@ -11,7 +11,7 @@ fn main() {
         join.push(std::thread::spawn(move || {
             for _ in 0..iterations {
                 atomic2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            }   
+            }
         }));
     }
     for j in join {
