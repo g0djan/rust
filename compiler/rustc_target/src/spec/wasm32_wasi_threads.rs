@@ -6,8 +6,10 @@ pub fn target() -> Target {
 
     options.os = "wasi".into();
 
-    options
-        .add_pre_link_args(LinkerFlavor::WasmLld(Cc::No), &["--import-memory", "--export-memory", "--shared-memory"]);
+    options.add_pre_link_args(
+        LinkerFlavor::WasmLld(Cc::No),
+        &["--import-memory", "--export-memory", "--shared-memory"],
+    );
     options.add_pre_link_args(
         LinkerFlavor::WasmLld(Cc::Yes),
         &[
