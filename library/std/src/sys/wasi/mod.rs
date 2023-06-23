@@ -29,16 +29,6 @@ pub mod fs;
 #[path = "../wasm/atomics/futex.rs"]
 pub mod futex;
 pub mod io;
-#[path = "../unix/locks"]
-pub mod locks {
-    #![allow(unsafe_op_in_unsafe_fn)]
-    mod futex_condvar;
-    mod futex_mutex;
-    mod futex_rwlock;
-    pub(crate) use futex_condvar::Condvar;
-    pub(crate) use futex_mutex::Mutex;
-    pub(crate) use futex_rwlock::RwLock;
-}
 
 pub mod net;
 pub mod os;
@@ -51,7 +41,6 @@ pub mod pipe;
 #[path = "../unsupported/process.rs"]
 pub mod process;
 pub mod stdio;
-pub mod thread;
 #[path = "../unsupported/thread_local_dtor.rs"]
 pub mod thread_local_dtor;
 #[path = "../unsupported/thread_local_key.rs"]
@@ -59,9 +48,27 @@ pub mod thread_local_key;
 pub mod time;
 
 cfg_if::cfg_if! {
-    if #[cfg(not(target_feature = "atomics"))] {
+    if #[cfg(target_feature = "atomics")] {
+        #[path = "../unix/locks"]
+        pub mod locks {
+            #![allow(unsafe_op_in_unsafe_fn)]
+            mod futex_condvar;
+            mod futex_mutex;
+            mod futex_rwlock;
+            pub(crate) use futex_condvar::Condvar;
+            pub(crate) use futex_mutex::Mutex;
+            pub(crate) use futex_rwlock::RwLock;
+        }
+        pub mod thread;
+    } else {
+        #[path = "../unsupported/locks/mod.rs"]
+        pub mod locks;
         #[path = "../unsupported/once.rs"]
         pub mod once;
+        #[path = "../unsupported/thread.rs"]
+        pub mod thread;
+        #[path = "../unsupported/thread_parking.rs"]
+        pub mod thread_parking;
     }
 }
 

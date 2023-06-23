@@ -5,9 +5,9 @@ pub fn target() -> Target {
     let mut options = wasm_base::options();
 
     options.os = "wasi".into();
-    // options.add_pre_link_args(LinkerFlavor::WasmLld(Cc::Yes), &["--target=wasm32-wasi-threads"]);
+
     options
-        .add_pre_link_args(LinkerFlavor::WasmLld(Cc::No), &["--import-memory", "--shared-memory"]);
+        .add_pre_link_args(LinkerFlavor::WasmLld(Cc::No), &["--import-memory", "--export-memory", "--shared-memory"]);
     options.add_pre_link_args(
         LinkerFlavor::WasmLld(Cc::Yes),
         &[
