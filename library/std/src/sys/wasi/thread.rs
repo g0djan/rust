@@ -62,60 +62,60 @@ pub const DEFAULT_MIN_STACK_SIZE: usize = 4096;
 
 impl Thread {
     // unsafe: see thread::Builder::spawn_unchecked for safety requirements
-cfg_if::cfg_if! {
-    if #[cfg(target_feature = "atomics")] {
-        pub unsafe fn new(stack: usize, p: Box<dyn FnOnce()>) -> io::Result<Thread> {
-            let p = Box::into_raw(Box::new(p));
-            let mut native: libc::pthread_t = mem::zeroed();
-            let mut attr: libc::pthread_attr_t = mem::zeroed();
-            assert_eq!(libc::pthread_attr_init(&mut attr), 0);
+    cfg_if::cfg_if! {
+        if #[cfg(target_feature = "atomics")] {
+            pub unsafe fn new(stack: usize, p: Box<dyn FnOnce()>) -> io::Result<Thread> {
+                let p = Box::into_raw(Box::new(p));
+                let mut native: libc::pthread_t = mem::zeroed();
+                let mut attr: libc::pthread_attr_t = mem::zeroed();
+                assert_eq!(libc::pthread_attr_init(&mut attr), 0);
 
-            let stack_size = cmp::max(stack, DEFAULT_MIN_STACK_SIZE);
+                let stack_size = cmp::max(stack, DEFAULT_MIN_STACK_SIZE);
 
-            match libc::pthread_attr_setstacksize(&mut attr, stack_size) {
-                0 => {}
-                n => {
-                    assert_eq!(n, libc::EINVAL);
-                    // EINVAL means |stack_size| is either too small or not a
-                    // multiple of the system page size. Because it's definitely
-                    // >= PTHREAD_STACK_MIN, it must be an alignment issue.
-                    // Round up to the nearest page and try again.
-                    let page_size = os::page_size();
-                    let stack_size =
-                        (stack_size + page_size - 1) & (-(page_size as isize - 1) as usize - 1);
-                    assert_eq!(libc::pthread_attr_setstacksize(&mut attr, stack_size), 0);
+                match libc::pthread_attr_setstacksize(&mut attr, stack_size) {
+                    0 => {}
+                    n => {
+                        assert_eq!(n, libc::EINVAL);
+                        // EINVAL means |stack_size| is either too small or not a
+                        // multiple of the system page size. Because it's definitely
+                        // >= PTHREAD_STACK_MIN, it must be an alignment issue.
+                        // Round up to the nearest page and try again.
+                        let page_size = os::page_size();
+                        let stack_size =
+                            (stack_size + page_size - 1) & (-(page_size as isize - 1) as usize - 1);
+                        assert_eq!(libc::pthread_attr_setstacksize(&mut attr, stack_size), 0);
+                    }
+                };
+
+                let ret = libc::pthread_create(&mut native, &attr, thread_start, p as *mut _);
+                // Note: if the thread creation fails and this assert fails, then p will
+                // be leaked. However, an alternative design could cause double-free
+                // which is clearly worse.
+                assert_eq!(libc::pthread_attr_destroy(&mut attr), 0);
+
+                return if ret != 0 {
+                    // The thread failed to start and as a result p was not consumed. Therefore, it is
+                    // safe to reconstruct the box so that it gets deallocated.
+                    drop(Box::from_raw(p));
+                    Err(io::Error::from_raw_os_error(ret))
+                } else {
+                    Ok(Thread { id: native })
+                };
+
+                extern "C" fn thread_start(main: *mut libc::c_void) -> *mut libc::c_void {
+                    unsafe {
+                        // Finally, let's run some code.
+                        Box::from_raw(main as *mut Box<dyn FnOnce()>)();
+                    }
+                    ptr::null_mut()
                 }
-            };
-
-            let ret = libc::pthread_create(&mut native, &attr, thread_start, p as *mut _);
-            // Note: if the thread creation fails and this assert fails, then p will
-            // be leaked. However, an alternative design could cause double-free
-            // which is clearly worse.
-            assert_eq!(libc::pthread_attr_destroy(&mut attr), 0);
-
-            return if ret != 0 {
-                // The thread failed to start and as a result p was not consumed. Therefore, it is
-                // safe to reconstruct the box so that it gets deallocated.
-                drop(Box::from_raw(p));
-                Err(io::Error::from_raw_os_error(ret))
-            } else {
-                Ok(Thread { id: native })
-            };
-
-            extern "C" fn thread_start(main: *mut libc::c_void) -> *mut libc::c_void {
-                unsafe {
-                    // Finally, let's run some code.
-                    Box::from_raw(main as *mut Box<dyn FnOnce()>)();
-                }
-                ptr::null_mut()
+            }
+        } else {
+            pub unsafe fn new(_stack: usize, _p: Box<dyn FnOnce()>) -> io::Result<Thread> {
+                unsupported()
             }
         }
-    } else {
-        pub unsafe fn new(_stack: usize, _p: Box<dyn FnOnce()>) -> io::Result<Thread> {
-            unsupported()
-        }
     }
-}
 
     pub fn yield_now() {
         let ret = unsafe { wasi::sched_yield() };
