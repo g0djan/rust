@@ -41,6 +41,7 @@ pub mod pipe;
 #[path = "../unsupported/process.rs"]
 pub mod process;
 pub mod stdio;
+pub mod thread;
 #[path = "../unsupported/thread_local_dtor.rs"]
 pub mod thread_local_dtor;
 #[path = "../unsupported/thread_local_key.rs"]
@@ -59,14 +60,11 @@ cfg_if::cfg_if! {
             pub(crate) use futex_mutex::Mutex;
             pub(crate) use futex_rwlock::RwLock;
         }
-        pub mod thread;
     } else {
         #[path = "../unsupported/locks/mod.rs"]
         pub mod locks;
         #[path = "../unsupported/once.rs"]
         pub mod once;
-        #[path = "../unsupported/thread.rs"]
-        pub mod thread;
         #[path = "../unsupported/thread_parking.rs"]
         pub mod thread_parking;
     }
