@@ -2506,7 +2506,13 @@ impl<'test> TestCx<'test> {
         let mut args = self.split_maybe_args(&self.config.runtool);
 
         // If this is emscripten, then run tests under nodejs
-        if self.config.target.contains("emscripten") {
+        if self.config.target.contains("wasi-threads") {
+            args.push("wasmtime".into());
+            args.push("--wasm-features=threads".into());
+            args.push("--wasi-modules=experimental-wasi-threads".into());
+        } else if self.config.target.contains("wasi") {
+            args.push("wasmtime".into());
+        } else if self.config.target.contains("emscripten") {
             if let Some(ref p) = self.config.nodejs {
                 args.push(p.clone());
             } else {

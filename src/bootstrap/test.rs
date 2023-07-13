@@ -2265,7 +2265,13 @@ fn prepare_cargo_test(
     dylib_path.insert(0, PathBuf::from(&*builder.sysroot_libdir(compiler, target)));
     cargo.env(dylib_path_var(), env::join_paths(&dylib_path).unwrap());
 
-    if target.contains("emscripten") {
+    if target.contains("wasi-threads") {
+        let runner = "wasmtime --wasm-features=threads --wasi-modules=experimental-wasi-threads";
+        cargo.env(format!("CARGO_TARGET_{}_RUNNER", envify(&target.triple)), &runner);
+    } else if target.contains("wasi") {
+        let runner = "wasmtime";
+        cargo.env(format!("CARGO_TARGET_{}_RUNNER", envify(&target.triple)), &runner);
+    } else if target.contains("emscripten") {
         cargo.env(
             format!("CARGO_TARGET_{}_RUNNER", envify(&target.triple)),
             builder.config.nodejs.as_ref().expect("nodejs not configured"),
