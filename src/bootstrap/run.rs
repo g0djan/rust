@@ -41,7 +41,7 @@ impl Step for ExpandYamlAnchors {
 
 fn try_run(builder: &Builder<'_>, cmd: &mut Command) -> bool {
     if !builder.fail_fast {
-        if !builder.try_run(cmd) {
+        if builder.try_run(cmd).is_err() {
             let mut failures = builder.delayed_failures.borrow_mut();
             failures.push(format!("{:?}", cmd));
             return false;

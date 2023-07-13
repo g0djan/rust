@@ -960,6 +960,8 @@ pub(crate) mod builtin {
     ///
     /// A compile time error is never emitted when using this macro regardless
     /// of whether the environment variable is present or not.
+    /// To emit a compile error if the environment variable is not present,
+    /// use the [`env!`] macro instead.
     ///
     /// # Examples
     ///
@@ -1427,7 +1429,7 @@ pub(crate) mod builtin {
     #[rustc_builtin_macro]
     #[macro_export]
     #[rustc_diagnostic_item = "assert_macro"]
-    #[allow_internal_unstable(core_panic, edition_panic)]
+    #[allow_internal_unstable(core_panic, edition_panic, generic_assert_internals)]
     macro_rules! assert {
         ($cond:expr $(,)?) => {{ /* compiler built-in */ }};
         ($cond:expr, $($arg:tt)+) => {{ /* compiler built-in */ }};

@@ -27,6 +27,7 @@ use std::process::{Command, Stdio};
 use std::str;
 
 use build_helper::ci::{gha, CiEnv};
+use build_helper::detail_exit_macro;
 use channel::GitInfo;
 use config::{DryRun, Target};
 use filetime::FileTime;
@@ -60,6 +61,7 @@ mod run;
 mod sanity;
 mod setup;
 mod suggest;
+mod synthetic_targets;
 mod tarball;
 mod test;
 mod tool;
@@ -221,13 +223,14 @@ pub struct Build {
     initial_cargo: PathBuf,
     initial_lld: PathBuf,
     initial_libdir: PathBuf,
+    initial_sysroot: PathBuf,
 
     // Runtime state filled in later on
     // C/C++ compilers and archiver for all targets
-    cc: HashMap<TargetSelection, cc::Tool>,
-    cxx: HashMap<TargetSelection, cc::Tool>,
-    ar: HashMap<TargetSelection, PathBuf>,
-    ranlib: HashMap<TargetSelection, PathBuf>,
+    cc: RefCell<HashMap<TargetSelection, cc::Tool>>,
+    cxx: RefCell<HashMap<TargetSelection, cc::Tool>>,
+    ar: RefCell<HashMap<TargetSelection, PathBuf>>,
+    ranlib: RefCell<HashMap<TargetSelection, PathBuf>>,
     // Miscellaneous
     // allow bidirectional lookups: both name -> path and path -> name
     crates: HashMap<Interned<String>, Crate>,
@@ -330,7 +333,7 @@ forward! {
     create(path: &Path, s: &str),
     remove(f: &Path),
     tempdir() -> PathBuf,
-    try_run(cmd: &mut Command) -> bool,
+    try_run(cmd: &mut Command) -> Result<(), ()>,
     llvm_link_shared() -> bool,
     download_rustc() -> bool,
     initial_rustfmt() -> Option<PathBuf>,
@@ -388,13 +391,16 @@ impl Build {
             "/dummy".to_string()
         } else {
             output(Command::new(&config.initial_rustc).arg("--print").arg("sysroot"))
-        };
+        }
+        .trim()
+        .to_string();
+
         let initial_libdir = initial_target_dir
             .parent()
             .unwrap()
             .parent()
             .unwrap()
-            .strip_prefix(initial_sysroot.trim())
+            .strip_prefix(&initial_sysroot)
             .unwrap()
             .to_path_buf();
 
@@ -414,7 +420,6 @@ impl Build {
                 bootstrap_out.display()
             )
         }
-        config.check_build_rustc_version();
 
         if rust_info.is_from_tarball() && config.description.is_none() {
             config.description = Some("built from a source tarball".to_owned());
@@ -425,6 +430,7 @@ impl Build {
             initial_cargo: config.initial_cargo.clone(),
             initial_lld,
             initial_libdir,
+            initial_sysroot: initial_sysroot.into(),
             local_rebuild: config.local_rebuild,
             fail_fast: config.cmd.fail_fast(),
             doc_tests: config.cmd.doc_tests(),
@@ -446,10 +452,10 @@ impl Build {
             miri_info,
             rustfmt_info,
             in_tree_llvm_info,
-            cc: HashMap::new(),
-            cxx: HashMap::new(),
-            ar: HashMap::new(),
-            ranlib: HashMap::new(),
+            cc: RefCell::new(HashMap::new()),
+            cxx: RefCell::new(HashMap::new()),
+            ar: RefCell::new(HashMap::new()),
+            ranlib: RefCell::new(HashMap::new()),
             crates: HashMap::new(),
             crate_paths: HashMap::new(),
             is_sudo,
@@ -477,7 +483,7 @@ impl Build {
         }
 
         build.verbose("finding compilers");
-        cc_detect::find(&mut build);
+        cc_detect::find(&build);
         // When running `setup`, the profile is about to change, so any requirements we have now may
         // be different on the next invocation. Don't check for them until the next time x.py is
         // run. This is ok because `setup` never runs any build commands, so it won't fail if commands are missing.
@@ -593,6 +599,9 @@ impl Build {
 
             let mut git = self.config.git();
             if let Some(branch) = current_branch {
+                // If there is a tag named after the current branch, git will try to disambiguate by prepending `heads/` to the branch name.
+                // This syntax isn't accepted by `branch.{branch}`. Strip it.
+                let branch = branch.strip_prefix("heads/").unwrap_or(&branch);
                 git.arg("-c").arg(format!("branch.{branch}.remote=origin"));
             }
             git.args(&["submodule", "update", "--init", "--recursive", "--depth=1"]);
@@ -608,11 +617,13 @@ impl Build {
         }
 
         // Save any local changes, but avoid running `git stash pop` if there are none (since it will exit with an error).
-        let has_local_modifications = !self.try_run(
-            Command::new("git")
-                .args(&["diff-index", "--quiet", "HEAD"])
-                .current_dir(&absolute_path),
-        );
+        let has_local_modifications = self
+            .try_run(
+                Command::new("git")
+                    .args(&["diff-index", "--quiet", "HEAD"])
+                    .current_dir(&absolute_path),
+            )
+            .is_err();
         if has_local_modifications {
             self.run(Command::new("git").args(&["stash", "push"]).current_dir(&absolute_path));
         }
@@ -700,7 +711,7 @@ impl Build {
             for failure in failures.iter() {
                 eprintln!("  - {}\n", failure);
             }
-            detail_exit(1);
+            detail_exit_macro!(1);
         }
 
         #[cfg(feature = "build-metrics")]
@@ -777,7 +788,7 @@ impl Build {
     /// Component directory that Cargo will produce output into (e.g.
     /// release/debug)
     fn cargo_dir(&self) -> &'static str {
-        if self.config.rust_optimize { "release" } else { "debug" }
+        if self.config.rust_optimize.is_release() { "release" } else { "debug" }
     }
 
     fn tools_dir(&self, compiler: Compiler) -> PathBuf {
@@ -809,11 +820,6 @@ impl Build {
     /// standard library, and targeting the specified architecture.
     fn cargo_out(&self, compiler: Compiler, mode: Mode, target: TargetSelection) -> PathBuf {
         self.stage_out(compiler, mode).join(&*target.triple).join(self.cargo_dir())
-    }
-
-    /// Directory where the extracted `rustc-dev` component is stored.
-    fn ci_rustc_dir(&self, target: TargetSelection) -> PathBuf {
-        self.out.join(&*target.triple).join("ci-rustc")
     }
 
     /// Root output directory for LLVM compiled for `target`
@@ -1001,6 +1007,15 @@ impl Build {
         self.msg(Kind::Check, self.config.stage, what, self.config.build, target)
     }
 
+    fn msg_doc(
+        &self,
+        compiler: Compiler,
+        what: impl Display,
+        target: impl Into<Option<TargetSelection>> + Copy,
+    ) -> Option<gha::Group> {
+        self.msg(Kind::Doc, compiler.stage, what, compiler.host, target.into())
+    }
+
     fn msg_build(
         &self,
         compiler: Compiler,
@@ -1011,6 +1026,8 @@ impl Build {
     }
 
     /// Return a `Group` guard for a [`Step`] that is built for each `--stage`.
+    ///
+    /// [`Step`]: crate::builder::Step
     fn msg(
         &self,
         action: impl Into<Kind>,
@@ -1019,8 +1036,8 @@ impl Build {
         host: impl Into<Option<TargetSelection>>,
         target: impl Into<Option<TargetSelection>>,
     ) -> Option<gha::Group> {
-        let action = action.into();
-        let msg = |fmt| format!("{action:?}ing stage{stage} {what}{fmt}");
+        let action = action.into().description();
+        let msg = |fmt| format!("{action} stage{stage} {what}{fmt}");
         let msg = if let Some(target) = target.into() {
             let host = host.into().unwrap();
             if host == target {
@@ -1035,14 +1052,16 @@ impl Build {
     }
 
     /// Return a `Group` guard for a [`Step`] that is only built once and isn't affected by `--stage`.
+    ///
+    /// [`Step`]: crate::builder::Step
     fn msg_unstaged(
         &self,
         action: impl Into<Kind>,
         what: impl Display,
         target: TargetSelection,
     ) -> Option<gha::Group> {
-        let action = action.into();
-        let msg = format!("{action:?}ing {what} for {target}");
+        let action = action.into().description();
+        let msg = format!("{action} {what} for {target}");
         self.group(&msg)
     }
 
@@ -1054,8 +1073,8 @@ impl Build {
         host: TargetSelection,
         target: TargetSelection,
     ) -> Option<gha::Group> {
-        let action = action.into();
-        let msg = |fmt| format!("{action:?}ing {what} {fmt}");
+        let action = action.into().description();
+        let msg = |fmt| format!("{action} {what} {fmt}");
         let msg = if host == target {
             msg(format_args!("(stage{stage} -> stage{}, {target})", stage + 1))
         } else {
@@ -1065,7 +1084,6 @@ impl Build {
     }
 
     fn group(&self, msg: &str) -> Option<gha::Group> {
-        self.info(&msg);
         match self.config.dry_run {
             DryRun::SelfCheck => None,
             DryRun::Disabled | DryRun::UserSelected => Some(gha::group(&msg)),
@@ -1095,16 +1113,22 @@ impl Build {
     }
 
     /// Returns the path to the C compiler for the target specified.
-    fn cc(&self, target: TargetSelection) -> &Path {
-        self.cc[&target].path()
+    fn cc(&self, target: TargetSelection) -> PathBuf {
+        if self.config.dry_run() {
+            return PathBuf::new();
+        }
+        self.cc.borrow()[&target].path().into()
     }
 
     /// Returns a list of flags to pass to the C compiler for the target
     /// specified.
     fn cflags(&self, target: TargetSelection, which: GitRepo, c: CLang) -> Vec<String> {
+        if self.config.dry_run() {
+            return Vec::new();
+        }
         let base = match c {
-            CLang::C => &self.cc[&target],
-            CLang::Cxx => &self.cxx[&target],
+            CLang::C => self.cc.borrow()[&target].clone(),
+            CLang::Cxx => self.cxx.borrow()[&target].clone(),
         };
 
         // Filter out -O and /O (the optimization flags) that we picked up from
@@ -1145,19 +1169,28 @@ impl Build {
     }
 
     /// Returns the path to the `ar` archive utility for the target specified.
-    fn ar(&self, target: TargetSelection) -> Option<&Path> {
-        self.ar.get(&target).map(|p| &**p)
+    fn ar(&self, target: TargetSelection) -> Option<PathBuf> {
+        if self.config.dry_run() {
+            return None;
+        }
+        self.ar.borrow().get(&target).cloned()
     }
 
     /// Returns the path to the `ranlib` utility for the target specified.
-    fn ranlib(&self, target: TargetSelection) -> Option<&Path> {
-        self.ranlib.get(&target).map(|p| &**p)
+    fn ranlib(&self, target: TargetSelection) -> Option<PathBuf> {
+        if self.config.dry_run() {
+            return None;
+        }
+        self.ranlib.borrow().get(&target).cloned()
     }
 
     /// Returns the path to the C++ compiler for the target specified.
-    fn cxx(&self, target: TargetSelection) -> Result<&Path, String> {
-        match self.cxx.get(&target) {
-            Some(p) => Ok(p.path()),
+    fn cxx(&self, target: TargetSelection) -> Result<PathBuf, String> {
+        if self.config.dry_run() {
+            return Ok(PathBuf::new());
+        }
+        match self.cxx.borrow().get(&target) {
+            Some(p) => Ok(p.path().into()),
             None => {
                 Err(format!("target `{}` is not configured as a host, only as a target", target))
             }
@@ -1165,21 +1198,24 @@ impl Build {
     }
 
     /// Returns the path to the linker for the given target if it needs to be overridden.
-    fn linker(&self, target: TargetSelection) -> Option<&Path> {
-        if let Some(linker) = self.config.target_config.get(&target).and_then(|c| c.linker.as_ref())
+    fn linker(&self, target: TargetSelection) -> Option<PathBuf> {
+        if self.config.dry_run() {
+            return Some(PathBuf::new());
+        }
+        if let Some(linker) = self.config.target_config.get(&target).and_then(|c| c.linker.clone())
         {
             Some(linker)
         } else if target.contains("vxworks") {
             // need to use CXX compiler as linker to resolve the exception functions
             // that are only existed in CXX libraries
-            Some(self.cxx[&target].path())
+            Some(self.cxx.borrow()[&target].path().into())
         } else if target != self.config.build
             && util::use_host_linker(target)
             && !target.contains("msvc")
         {
             Some(self.cc(target))
         } else if self.config.use_lld && !self.is_fuse_ld_lld(target) && self.build == target {
-            Some(&self.initial_lld)
+            Some(self.initial_lld.clone())
         } else {
             None
         }
@@ -1324,7 +1360,7 @@ impl Build {
         match &self.config.channel[..] {
             "stable" => num.to_string(),
             "beta" => {
-                if self.rust_info().is_managed_git_subrepository() && !self.config.omit_git_hash {
+                if !self.config.omit_git_hash {
                     format!("{}-beta.{}", num, self.beta_prerelease_version())
                 } else {
                     format!("{}-beta", num)
@@ -1336,18 +1372,28 @@ impl Build {
     }
 
     fn beta_prerelease_version(&self) -> u32 {
+        fn extract_beta_rev_from_file<P: AsRef<Path>>(version_file: P) -> Option<String> {
+            let version = fs::read_to_string(version_file).ok()?;
+
+            extract_beta_rev(&version)
+        }
+
         if let Some(s) = self.prerelease_version.get() {
             return s;
         }
 
-        // Figure out how many merge commits happened since we branched off master.
-        // That's our beta number!
-        // (Note that we use a `..` range, not the `...` symmetric difference.)
-        let count =
+        // First check if there is a version file available.
+        // If available, we read the beta revision from that file.
+        // This only happens when building from a source tarball when Git should not be used.
+        let count = extract_beta_rev_from_file(self.src.join("version")).unwrap_or_else(|| {
+            // Figure out how many merge commits happened since we branched off master.
+            // That's our beta number!
+            // (Note that we use a `..` range, not the `...` symmetric difference.)
             output(self.config.git().arg("rev-list").arg("--count").arg("--merges").arg(format!(
                 "refs/remotes/origin/{}..HEAD",
                 self.config.stage0_metadata.config.nightly_branch
-            )));
+            )))
+        });
         let n = count.trim().parse().unwrap();
         self.prerelease_version.set(Some(n));
         n
@@ -1469,7 +1515,7 @@ impl Build {
                 "Error: Unable to find the stamp file {}, did you try to keep a nonexistent build stage?",
                 stamp.display()
             );
-            crate::detail_exit(1);
+            crate::detail_exit_macro!(1);
         }
 
         let mut paths = Vec::new();
@@ -1661,7 +1707,7 @@ Alternatively, set `download-ci-llvm = true` in that `[llvm]` section
 to download LLVM rather than building it.
 "
                 );
-                detail_exit(1);
+                detail_exit_macro!(1);
             }
         }
 
@@ -1707,6 +1753,17 @@ to download LLVM rather than building it.
     }
 }
 
+/// Extract the beta revision from the full version string.
+///
+/// The full version string looks like "a.b.c-beta.y". And we need to extract
+/// the "y" part from the string.
+pub fn extract_beta_rev(version: &str) -> Option<String> {
+    let parts = version.splitn(2, "-beta.").collect::<Vec<_>>();
+    let count = parts.get(1).and_then(|s| s.find(' ').map(|p| (&s[..p]).to_string()));
+
+    count
+}
+
 #[cfg(unix)]
 fn chmod(path: &Path, perms: u32) {
     use std::os::unix::fs::*;
@@ -1714,18 +1771,6 @@ fn chmod(path: &Path, perms: u32) {
 }
 #[cfg(windows)]
 fn chmod(_path: &Path, _perms: u32) {}
-
-/// If code is not 0 (successful exit status), exit status is 101 (rust's default error code.)
-/// If the test is running and code is an error code, it will cause a panic.
-fn detail_exit(code: i32) -> ! {
-    // if in test and code is an error code, panic with status code provided
-    if cfg!(test) {
-        panic!("status code: {}", code);
-    } else {
-        // otherwise,exit with provided status code
-        std::process::exit(code);
-    }
-}
 
 impl Compiler {
     pub fn with_stage(mut self, stage: u32) -> Compiler {

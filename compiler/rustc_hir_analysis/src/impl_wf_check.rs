@@ -106,10 +106,10 @@ fn enforce_impl_params_are_constrained(tcx: TyCtxt<'_>, impl_def_id: LocalDefId)
                     if item.defaultness(tcx).has_value() {
                         cgp::parameters_for(&tcx.type_of(def_id).subst_identity(), true)
                     } else {
-                        Vec::new()
+                        vec![]
                     }
                 }
-                ty::AssocKind::Fn | ty::AssocKind::Const => Vec::new(),
+                ty::AssocKind::Fn | ty::AssocKind::Const => vec![],
             }
         })
         .collect();

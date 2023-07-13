@@ -16,6 +16,7 @@
 
 use crate::{passes::LateLintPassObject, LateContext, LateLintPass, LintStore};
 use rustc_ast as ast;
+use rustc_data_structures::stack::ensure_sufficient_stack;
 use rustc_data_structures::sync::{join, DynSend};
 use rustc_hir as hir;
 use rustc_hir::def_id::LocalDefId;
@@ -157,10 +158,12 @@ impl<'tcx, T: LateLintPass<'tcx>> hir_visit::Visitor<'tcx> for LateContextAndPas
     }
 
     fn visit_expr(&mut self, e: &'tcx hir::Expr<'tcx>) {
-        self.with_lint_attrs(e.hir_id, |cx| {
-            lint_callback!(cx, check_expr, e);
-            hir_visit::walk_expr(cx, e);
-            lint_callback!(cx, check_expr_post, e);
+        ensure_sufficient_stack(|| {
+            self.with_lint_attrs(e.hir_id, |cx| {
+                lint_callback!(cx, check_expr, e);
+                hir_visit::walk_expr(cx, e);
+                lint_callback!(cx, check_expr_post, e);
+            })
         })
     }
 
@@ -240,8 +243,10 @@ impl<'tcx, T: LateLintPass<'tcx>> hir_visit::Visitor<'tcx> for LateContextAndPas
     }
 
     fn visit_arm(&mut self, a: &'tcx hir::Arm<'tcx>) {
-        lint_callback!(self, check_arm, a);
-        hir_visit::walk_arm(self, a);
+        self.with_lint_attrs(a.hir_id, |cx| {
+            lint_callback!(cx, check_arm, a);
+            hir_visit::walk_arm(cx, a);
+        })
     }
 
     fn visit_generic_param(&mut self, p: &'tcx hir::GenericParam<'tcx>) {

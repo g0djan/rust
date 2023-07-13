@@ -8,7 +8,6 @@ use crate::{errors, fluent_generated as fluent};
 use rustc_ast::{ast, AttrStyle, Attribute, LitKind, MetaItemKind, MetaItemLit, NestedMetaItem};
 use rustc_data_structures::fx::FxHashMap;
 use rustc_errors::{Applicability, IntoDiagnosticArg, MultiSpan};
-use rustc_expand::base::resolve_path;
 use rustc_feature::{AttributeDuplicates, AttributeType, BuiltinAttribute, BUILTIN_ATTRIBUTE_MAP};
 use rustc_hir as hir;
 use rustc_hir::def_id::LocalDefId;
@@ -111,9 +110,6 @@ impl CheckAttrVisitor<'_> {
                 sym::no_coverage => self.check_no_coverage(hir_id, attr, span, target),
                 sym::non_exhaustive => self.check_non_exhaustive(hir_id, attr, span, target),
                 sym::marker => self.check_marker(hir_id, attr, span, target),
-                sym::rustc_must_implement_one_of => {
-                    self.check_rustc_must_implement_one_of(attr, span, target)
-                }
                 sym::target_feature => self.check_target_feature(hir_id, attr, span, target),
                 sym::thread_local => self.check_thread_local(attr, span, target),
                 sym::track_caller => {
@@ -160,12 +156,14 @@ impl CheckAttrVisitor<'_> {
                 | sym::rustc_dirty
                 | sym::rustc_if_this_changed
                 | sym::rustc_then_this_would_need => self.check_rustc_dirty_clean(&attr),
-                sym::rustc_coinductive => self.check_rustc_coinductive(&attr, span, target),
+                sym::rustc_coinductive
+                | sym::rustc_must_implement_one_of
+                | sym::rustc_deny_explicit_impl
+                | sym::const_trait => self.check_must_be_applied_to_trait(&attr, span, target),
                 sym::cmse_nonsecure_entry => {
                     self.check_cmse_nonsecure_entry(hir_id, attr, span, target)
                 }
                 sym::collapse_debuginfo => self.check_collapse_debuginfo(attr, span, target),
-                sym::const_trait => self.check_const_trait(attr, span, target),
                 sym::must_not_suspend => self.check_must_not_suspend(&attr, span, target),
                 sym::must_use => self.check_must_use(hir_id, &attr, target),
                 sym::rustc_pass_by_value => self.check_pass_by_value(&attr, span, target),
@@ -568,25 +566,6 @@ impl CheckAttrVisitor<'_> {
         }
     }
 
-    /// Checks if the `#[rustc_must_implement_one_of]` attribute on a `target` is valid. Returns `true` if valid.
-    fn check_rustc_must_implement_one_of(
-        &self,
-        attr: &Attribute,
-        span: Span,
-        target: Target,
-    ) -> bool {
-        match target {
-            Target::Trait => true,
-            _ => {
-                self.tcx.sess.emit_err(errors::AttrShouldBeAppliedToTrait {
-                    attr_span: attr.span,
-                    defn_span: span,
-                });
-                false
-            }
-        }
-    }
-
     /// Checks if the `#[target_feature]` attribute on `item` is valid. Returns `true` if valid.
     fn check_target_feature(
         &self,
@@ -715,7 +694,6 @@ impl CheckAttrVisitor<'_> {
             | Target::GlobalAsm
             | Target::TyAlias
             | Target::OpaqueTy
-            | Target::ImplTraitPlaceholder
             | Target::Enum
             | Target::Variant
             | Target::Struct
@@ -945,18 +923,25 @@ impl CheckAttrVisitor<'_> {
         let mut is_valid = true;
         if let Some(metas) = meta.meta_item_list() {
             for i_meta in metas {
-                match i_meta.name_or_empty() {
-                    sym::attr | sym::no_crate_inject => {}
-                    _ => {
+                match (i_meta.name_or_empty(), i_meta.meta_item()) {
+                    (sym::attr | sym::no_crate_inject, _) => {}
+                    (_, Some(m)) => {
                         self.tcx.emit_spanned_lint(
                             INVALID_DOC_ATTRIBUTES,
                             hir_id,
                             i_meta.span(),
                             errors::DocTestUnknown {
-                                path: rustc_ast_pretty::pprust::path_to_string(
-                                    &i_meta.meta_item().unwrap().path,
-                                ),
+                                path: rustc_ast_pretty::pprust::path_to_string(&m.path),
                             },
+                        );
+                        is_valid = false;
+                    }
+                    (_, None) => {
+                        self.tcx.emit_spanned_lint(
+                            INVALID_DOC_ATTRIBUTES,
+                            hir_id,
+                            i_meta.span(),
+                            errors::DocTestLiteral,
                         );
                         is_valid = false;
                     }
@@ -1585,8 +1570,8 @@ impl CheckAttrVisitor<'_> {
         }
     }
 
-    /// Checks if the `#[rustc_coinductive]` attribute is applied to a trait.
-    fn check_rustc_coinductive(&self, attr: &Attribute, span: Span, target: Target) -> bool {
+    /// Checks if the attribute is applied to a trait.
+    fn check_must_be_applied_to_trait(&self, attr: &Attribute, span: Span, target: Target) -> bool {
         match target {
             Target::Trait => true,
             _ => {
@@ -1817,7 +1802,7 @@ impl CheckAttrVisitor<'_> {
             || (is_simd && is_c)
             || (int_reprs == 1
                 && is_c
-                && item.map_or(false, |item| {
+                && item.is_some_and(|item| {
                     if let ItemLike::Item(item) = item {
                         return is_c_like_enum(item);
                     }
@@ -1916,6 +1901,10 @@ impl CheckAttrVisitor<'_> {
 
     /// Checks if the items on the `#[debugger_visualizer]` attribute are valid.
     fn check_debugger_visualizer(&self, attr: &Attribute, target: Target) -> bool {
+        // Here we only check that the #[debugger_visualizer] attribute is attached
+        // to nothing other than a module. All other checks are done in the
+        // `debugger_visualizer` query where they need to be done for decoding
+        // anyway.
         match target {
             Target::Mod => {}
             _ => {
@@ -1924,53 +1913,7 @@ impl CheckAttrVisitor<'_> {
             }
         }
 
-        let Some(hints) = attr.meta_item_list() else {
-            self.tcx.sess.emit_err(errors::DebugVisualizerInvalid { span: attr.span });
-            return false;
-        };
-
-        let hint = match hints.len() {
-            1 => &hints[0],
-            _ => {
-                self.tcx.sess.emit_err(errors::DebugVisualizerInvalid { span: attr.span });
-                return false;
-            }
-        };
-
-        let Some(meta_item) = hint.meta_item() else {
-            self.tcx.sess.emit_err(errors::DebugVisualizerInvalid { span: attr.span });
-            return false;
-        };
-
-        let visualizer_path = match (meta_item.name_or_empty(), meta_item.value_str()) {
-            (sym::natvis_file, Some(value)) => value,
-            (sym::gdb_script_file, Some(value)) => value,
-            (_, _) => {
-                self.tcx.sess.emit_err(errors::DebugVisualizerInvalid { span: meta_item.span });
-                return false;
-            }
-        };
-
-        let file =
-            match resolve_path(&self.tcx.sess.parse_sess, visualizer_path.as_str(), attr.span) {
-                Ok(file) => file,
-                Err(mut err) => {
-                    err.emit();
-                    return false;
-                }
-            };
-
-        match std::fs::File::open(&file) {
-            Ok(_) => true,
-            Err(error) => {
-                self.tcx.sess.emit_err(errors::DebugVisualizerUnreadable {
-                    span: meta_item.span,
-                    file: &file,
-                    error,
-                });
-                false
-            }
-        }
+        true
     }
 
     /// Outputs an error for `#[allow_internal_unstable]` which can only be applied to macros.
@@ -2017,17 +1960,6 @@ impl CheckAttrVisitor<'_> {
                 self.tcx
                     .sess
                     .emit_err(errors::RustcStdInternalSymbol { attr_span: attr.span, span });
-                false
-            }
-        }
-    }
-
-    /// `#[const_trait]` only applies to traits.
-    fn check_const_trait(&self, attr: &Attribute, _span: Span, target: Target) -> bool {
-        match target {
-            Target::Trait => true,
-            _ => {
-                self.tcx.sess.emit_err(errors::ConstTrait { attr_span: attr.span });
                 false
             }
         }
@@ -2138,7 +2070,7 @@ impl CheckAttrVisitor<'_> {
                 | sym::feature
                 | sym::repr
                 | sym::target_feature
-        ) && attr.meta_item_list().map_or(false, |list| list.is_empty())
+        ) && attr.meta_item_list().is_some_and(|list| list.is_empty())
         {
             errors::UnusedNote::EmptyList { name: attr.name_or_empty() }
         } else if matches!(

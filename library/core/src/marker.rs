@@ -43,27 +43,17 @@ use crate::hash::Hasher;
 /// ```
 #[unstable(feature = "internal_impls_macro", issue = "none")]
 macro marker_impls {
-    ( $(#[$($meta:tt)*])* $Trait:ident for $( $({$($bounds:tt)*})? $T:ty ),+ $(,)?) => {
-        // This inner macro is needed because... idk macros are weird.
-        // It allows repeating `meta` on all impls.
-        #[unstable(feature = "internal_impls_macro", issue = "none")]
-        macro _impl {
-            ( $$({$$($$bounds_:tt)*})? $$T_:ty ) => {
-                $(#[$($meta)*])* impl<$$($$($$bounds_)*)?> $Trait for $$T_ {}
-            }
-        }
-        $( _impl! { $({$($bounds)*})? $T } )+
+    ( $(#[$($meta:tt)*])* $Trait:ident for $({$($bounds:tt)*})? $T:ty $(, $($rest:tt)*)? ) => {
+        $(#[$($meta)*])* impl< $($($bounds)*)? > $Trait for $T {}
+        marker_impls! { $(#[$($meta)*])* $Trait for $($($rest)*)? }
     },
-    ( $(#[$($meta:tt)*])* unsafe $Trait:ident for $( $({$($bounds:tt)*})? $T:ty ),+ $(,)?) => {
-        #[unstable(feature = "internal_impls_macro", issue = "none")]
-        macro _impl {
-            ( $$({$$($$bounds_:tt)*})? $$T_:ty ) => {
-                $(#[$($meta)*])* unsafe impl<$$($$($$bounds_)*)?> $Trait for $$T_ {}
-            }
-        }
+    ( $(#[$($meta:tt)*])* $Trait:ident for ) => {},
 
-        $( _impl! { $({$($bounds)*})? $T } )+
+    ( $(#[$($meta:tt)*])* unsafe $Trait:ident for $({$($bounds:tt)*})? $T:ty $(, $($rest:tt)*)? ) => {
+        $(#[$($meta)*])* unsafe impl< $($($bounds)*)? > $Trait for $T {}
+        marker_impls! { $(#[$($meta)*])* unsafe $Trait for $($($rest)*)? }
     },
+    ( $(#[$($meta:tt)*])* unsafe $Trait:ident for ) => {},
 }
 
 /// Types that can be transferred across thread boundaries.
@@ -150,7 +140,8 @@ unsafe impl<T: Sync + ?Sized> Send for &T {}
 )]
 #[fundamental] // for Default, for example, which requires that `[T]: !Default` be evaluatable
 #[rustc_specialization_trait]
-#[rustc_deny_explicit_impl]
+#[cfg_attr(not(bootstrap), rustc_deny_explicit_impl(implement_via_object = false))]
+#[cfg_attr(bootstrap, rustc_deny_explicit_impl)]
 #[rustc_coinductive]
 pub trait Sized {
     // Empty.
@@ -183,7 +174,8 @@ pub trait Sized {
 /// [nomicon-coerce]: ../../nomicon/coercions.html
 #[unstable(feature = "unsize", issue = "18598")]
 #[lang = "unsize"]
-#[rustc_deny_explicit_impl]
+#[cfg_attr(not(bootstrap), rustc_deny_explicit_impl(implement_via_object = false))]
+#[cfg_attr(bootstrap, rustc_deny_explicit_impl)]
 pub trait Unsize<T: ?Sized> {
     // Empty.
 }
@@ -213,6 +205,20 @@ pub trait Unsize<T: ?Sized> {
 #[lang = "structural_peq"]
 pub trait StructuralPartialEq {
     // Empty.
+}
+
+marker_impls! {
+    #[unstable(feature = "structural_match", issue = "31434")]
+    StructuralPartialEq for
+        usize, u8, u16, u32, u64, u128,
+        isize, i8, i16, i32, i64, i128,
+        bool,
+        char,
+        str /* Technically requires `[u8]: StructuralEq` */,
+        (),
+        {T, const N: usize} [T; N],
+        {T} [T],
+        {T: ?Sized} &T,
 }
 
 /// Required trait for constants used in pattern matches.
@@ -277,6 +283,7 @@ marker_impls! {
         bool,
         char,
         str /* Technically requires `[u8]: StructuralEq` */,
+        (),
         {T, const N: usize} [T; N],
         {T} [T],
         {T: ?Sized} &T,
@@ -568,59 +575,59 @@ impl<T: ?Sized> Copy for &T {}
 #[lang = "sync"]
 #[rustc_on_unimplemented(
     on(
-        _Self = "std::cell::OnceCell<T>",
+        any(_Self = "core::cell:OnceCell<T>", _Self = "std::cell::OnceCell<T>"),
         note = "if you want to do aliasing and mutation between multiple threads, use `std::sync::OnceLock` instead"
     ),
     on(
-        _Self = "std::cell::Cell<u8>",
+        any(_Self = "core::cell::Cell<u8>", _Self = "std::cell::Cell<u8>"),
         note = "if you want to do aliasing and mutation between multiple threads, use `std::sync::RwLock` or `std::sync::atomic::AtomicU8` instead",
     ),
     on(
-        _Self = "std::cell::Cell<u16>",
+        any(_Self = "core::cell::Cell<u16>", _Self = "std::cell::Cell<u16>"),
         note = "if you want to do aliasing and mutation between multiple threads, use `std::sync::RwLock` or `std::sync::atomic::AtomicU16` instead",
     ),
     on(
-        _Self = "std::cell::Cell<u32>",
+        any(_Self = "core::cell::Cell<u32>", _Self = "std::cell::Cell<u32>"),
         note = "if you want to do aliasing and mutation between multiple threads, use `std::sync::RwLock` or `std::sync::atomic::AtomicU32` instead",
     ),
     on(
-        _Self = "std::cell::Cell<u64>",
+        any(_Self = "core::cell::Cell<u64>", _Self = "std::cell::Cell<u64>"),
         note = "if you want to do aliasing and mutation between multiple threads, use `std::sync::RwLock` or `std::sync::atomic::AtomicU64` instead",
     ),
     on(
-        _Self = "std::cell::Cell<usize>",
+        any(_Self = "core::cell::Cell<usize>", _Self = "std::cell::Cell<usize>"),
         note = "if you want to do aliasing and mutation between multiple threads, use `std::sync::RwLock` or `std::sync::atomic::AtomicUsize` instead",
     ),
     on(
-        _Self = "std::cell::Cell<i8>",
+        any(_Self = "core::cell::Cell<i8>", _Self = "std::cell::Cell<i8>"),
         note = "if you want to do aliasing and mutation between multiple threads, use `std::sync::RwLock` or `std::sync::atomic::AtomicI8` instead",
     ),
     on(
-        _Self = "std::cell::Cell<i16>",
+        any(_Self = "core::cell::Cell<i16>", _Self = "std::cell::Cell<i16>"),
         note = "if you want to do aliasing and mutation between multiple threads, use `std::sync::RwLock` or `std::sync::atomic::AtomicI16` instead",
     ),
     on(
-        _Self = "std::cell::Cell<i32>",
+        any(_Self = "core::cell::Cell<i32>", _Self = "std::cell::Cell<i32>"),
         note = "if you want to do aliasing and mutation between multiple threads, use `std::sync::RwLock` or `std::sync::atomic::AtomicI32` instead",
     ),
     on(
-        _Self = "std::cell::Cell<i64>",
+        any(_Self = "core::cell::Cell<i64>", _Self = "std::cell::Cell<i64>"),
         note = "if you want to do aliasing and mutation between multiple threads, use `std::sync::RwLock` or `std::sync::atomic::AtomicI64` instead",
     ),
     on(
-        _Self = "std::cell::Cell<isize>",
+        any(_Self = "core::cell::Cell<isize>", _Self = "std::cell::Cell<isize>"),
         note = "if you want to do aliasing and mutation between multiple threads, use `std::sync::RwLock` or `std::sync::atomic::AtomicIsize` instead",
     ),
     on(
-        _Self = "std::cell::Cell<bool>",
+        any(_Self = "core::cell::Cell<bool>", _Self = "std::cell::Cell<bool>"),
         note = "if you want to do aliasing and mutation between multiple threads, use `std::sync::RwLock` or `std::sync::atomic::AtomicBool` instead",
     ),
     on(
-        _Self = "std::cell::Cell<T>",
+        any(_Self = "core::cell::Cell<T>", _Self = "std::cell::Cell<T>"),
         note = "if you want to do aliasing and mutation between multiple threads, use `std::sync::RwLock`",
     ),
     on(
-        _Self = "std::cell::RefCell<T>",
+        any(_Self = "core::cell::RefCell<T>", _Self = "std::cell::RefCell<T>"),
         note = "if you want to do aliasing and mutation between multiple threads, use `std::sync::RwLock` instead",
     ),
     message = "`{Self}` cannot be shared between threads safely",
@@ -849,7 +856,8 @@ impl<T: ?Sized> StructuralEq for PhantomData<T> {}
     reason = "this trait is unlikely to ever be stabilized, use `mem::discriminant` instead"
 )]
 #[lang = "discriminant_kind"]
-#[rustc_deny_explicit_impl]
+#[cfg_attr(not(bootstrap), rustc_deny_explicit_impl(implement_via_object = false))]
+#[cfg_attr(bootstrap, rustc_deny_explicit_impl)]
 pub trait DiscriminantKind {
     /// The type of the discriminant, which must satisfy the trait
     /// bounds required by `mem::Discriminant`.
@@ -954,7 +962,8 @@ marker_impls! {
 #[unstable(feature = "const_trait_impl", issue = "67792")]
 #[lang = "destruct"]
 #[rustc_on_unimplemented(message = "can't drop `{Self}`", append_const_msg)]
-#[rustc_deny_explicit_impl]
+#[cfg_attr(not(bootstrap), rustc_deny_explicit_impl(implement_via_object = false))]
+#[cfg_attr(bootstrap, rustc_deny_explicit_impl)]
 #[const_trait]
 pub trait Destruct {}
 
@@ -965,7 +974,8 @@ pub trait Destruct {}
 #[unstable(feature = "tuple_trait", issue = "none")]
 #[lang = "tuple_trait"]
 #[rustc_on_unimplemented(message = "`{Self}` is not a tuple")]
-#[rustc_deny_explicit_impl]
+#[cfg_attr(not(bootstrap), rustc_deny_explicit_impl(implement_via_object = false))]
+#[cfg_attr(bootstrap, rustc_deny_explicit_impl)]
 pub trait Tuple {}
 
 /// A marker for pointer-like types.
@@ -981,21 +991,20 @@ pub trait Tuple {}
 pub trait PointerLike {}
 
 /// A marker for types which can be used as types of `const` generic parameters.
-#[cfg_attr(not(bootstrap), lang = "const_param_ty")]
+#[lang = "const_param_ty"]
 #[unstable(feature = "adt_const_params", issue = "95174")]
 #[rustc_on_unimplemented(message = "`{Self}` can't be used as a const parameter type")]
-pub trait ConstParamTy: StructuralEq {}
+#[allow(multiple_supertrait_upcastable)]
+pub trait ConstParamTy: StructuralEq + StructuralPartialEq {}
 
-/// Derive macro generating an impl of the trait `Copy`.
+/// Derive macro generating an impl of the trait `ConstParamTy`.
 #[rustc_builtin_macro]
 #[unstable(feature = "adt_const_params", issue = "95174")]
-#[cfg(not(bootstrap))]
 pub macro ConstParamTy($item:item) {
     /* compiler built-in */
 }
 
-// FIXME(generic_const_parameter_types): handle `ty::FnDef`/`ty::Closure`
-// FIXME(generic_const_parameter_types): handle `ty::Tuple`
+// FIXME(adt_const_params): handle `ty::FnDef`/`ty::Closure`
 marker_impls! {
     #[unstable(feature = "adt_const_params", issue = "95174")]
     ConstParamTy for
@@ -1009,6 +1018,11 @@ marker_impls! {
         {T: ?Sized + ConstParamTy} &T,
 }
 
+// FIXME(adt_const_params): Add to marker_impls call above once not in bootstrap
+#[unstable(feature = "adt_const_params", issue = "95174")]
+#[cfg(not(bootstrap))]
+impl ConstParamTy for () {}
+
 /// A common trait implemented by all function pointers.
 #[unstable(
     feature = "fn_ptr_trait",
@@ -1016,7 +1030,8 @@ marker_impls! {
     reason = "internal trait for implementing various traits for all function pointers"
 )]
 #[lang = "fn_ptr_trait"]
-#[rustc_deny_explicit_impl]
+#[cfg_attr(not(bootstrap), rustc_deny_explicit_impl(implement_via_object = false))]
+#[cfg_attr(bootstrap, rustc_deny_explicit_impl)]
 pub trait FnPtr: Copy + Clone {
     /// Returns the address of the function pointer.
     #[lang = "fn_ptr_addr"]

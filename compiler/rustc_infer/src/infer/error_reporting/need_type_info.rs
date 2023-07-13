@@ -162,10 +162,18 @@ fn fmt_printer<'a, 'tcx>(infcx: &'a InferCtxt<'tcx>, ns: Namespace) -> FmtPrinte
         let mut infcx_inner = infcx.inner.borrow_mut();
         let ty_vars = infcx_inner.type_variables();
         let var_origin = ty_vars.var_origin(ty_vid);
-        if let TypeVariableOriginKind::TypeParameterDefinition(name, _) = var_origin.kind
+        if let TypeVariableOriginKind::TypeParameterDefinition(name, def_id) = var_origin.kind
             && !var_origin.span.from_expansion()
         {
-            Some(name)
+            let generics = infcx.tcx.generics_of(infcx.tcx.parent(def_id));
+            let idx = generics.param_def_id_to_index(infcx.tcx, def_id).unwrap();
+            let generic_param_def = generics.param_at(idx as usize, infcx.tcx);
+            if let ty::GenericParamDefKind::Type { synthetic: true, .. } = generic_param_def.kind
+            {
+                None
+            } else {
+                Some(name)
+            }
         } else {
             None
         }
@@ -265,9 +273,9 @@ impl<'tcx> InferCtxt<'tcx> {
                                 kind: UnderspecifiedArgKind::Type {
                                     prefix: "type parameter".into(),
                                 },
-                                parent: def_id.and_then(|def_id| {
-                                    InferenceDiagnosticsParentData::for_def_id(self.tcx, def_id)
-                                }),
+                                parent: InferenceDiagnosticsParentData::for_def_id(
+                                    self.tcx, def_id,
+                                ),
                             };
                         }
                     }
@@ -671,7 +679,7 @@ impl<'tcx> InferSource<'tcx> {
                 receiver.span.from_expansion()
             }
             InferSourceKind::ClosureReturn { data, should_wrap_expr, .. } => {
-                data.span().from_expansion() || should_wrap_expr.map_or(false, Span::from_expansion)
+                data.span().from_expansion() || should_wrap_expr.is_some_and(Span::from_expansion)
             }
         };
         source_from_expansion || self.span.from_expansion()
@@ -984,7 +992,7 @@ impl<'a, 'tcx> FindInferSourceVisitor<'a, 'tcx> {
     ) -> impl Iterator<Item = InsertableGenericArgs<'tcx>> + 'a {
         let tcx = self.infcx.tcx;
         let have_turbofish = path.segments.iter().any(|segment| {
-            segment.args.map_or(false, |args| args.args.iter().any(|arg| arg.is_ty_or_const()))
+            segment.args.is_some_and(|args| args.args.iter().any(|arg| arg.is_ty_or_const()))
         });
         // The last segment of a path often has `Res::Err` and the
         // correct `Res` is the one of the whole path.

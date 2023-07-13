@@ -1,7 +1,8 @@
 use crate::callee::{self, DeferredCallResolution};
+use crate::errors::CtorIsPrivate;
 use crate::method::{self, MethodCallee, SelfSource};
 use crate::rvalue_scopes;
-use crate::{BreakableCtxt, Diverges, Expectation, FnCtxt, LocalTy, RawTy};
+use crate::{BreakableCtxt, Diverges, Expectation, FnCtxt, RawTy};
 use rustc_data_structures::captures::Captures;
 use rustc_data_structures::fx::FxHashSet;
 use rustc_errors::{Applicability, Diagnostic, ErrorGuaranteed, MultiSpan, StashKey};
@@ -35,7 +36,9 @@ use rustc_span::symbol::{kw, sym, Ident};
 use rustc_span::Span;
 use rustc_target::abi::FieldIdx;
 use rustc_trait_selection::traits::error_reporting::TypeErrCtxtExt as _;
-use rustc_trait_selection::traits::{self, NormalizeExt, ObligationCauseCode, ObligationCtxt};
+use rustc_trait_selection::traits::{
+    self, NormalizeExt, ObligationCauseCode, ObligationCtxt, StructurallyNormalizeExt,
+};
 
 use std::collections::hash_map::Entry;
 use std::slice;
@@ -80,6 +83,8 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
     /// version (resolve_vars_if_possible), this version will
     /// also select obligations if it seems useful, in an effort
     /// to get more type information.
+    // FIXME(-Ztrait-solver=next): A lot of the calls to this method should
+    // probably be `try_structurally_resolve_type` or `structurally_resolve_type` instead.
     pub(in super::super) fn resolve_vars_with_obligations(&self, ty: Ty<'tcx>) -> Ty<'tcx> {
         self.resolve_vars_with_obligations_and_mutate_fulfillment(ty, |_| {})
     }
@@ -132,7 +137,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         format!("{:p}", self)
     }
 
-    pub fn local_ty(&self, span: Span, nid: hir::HirId) -> LocalTy<'tcx> {
+    pub fn local_ty(&self, span: Span, nid: hir::HirId) -> Ty<'tcx> {
         self.locals.borrow().get(&nid).cloned().unwrap_or_else(|| {
             span_bug!(span, "no type for local variable {}", self.tcx.hir().node_to_string(nid))
         })
@@ -448,7 +453,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
     pub fn node_ty(&self, id: hir::HirId) -> Ty<'tcx> {
         match self.typeck_results.borrow().node_types().get(id) {
             Some(&t) => t,
-            None if let Some(e) = self.tainted_by_errors() => self.tcx.ty_error(e),
+            None if let Some(e) = self.tainted_by_errors() => Ty::new_error(self.tcx,e),
             None => {
                 bug!(
                     "no type for node {} in fcx {}",
@@ -462,7 +467,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
     pub fn node_ty_opt(&self, id: hir::HirId) -> Option<Ty<'tcx>> {
         match self.typeck_results.borrow().node_types().get(id) {
             Some(&t) => Some(t),
-            None if let Some(e) = self.tainted_by_errors() => Some(self.tcx.ty_error(e)),
+            None if let Some(e) = self.tainted_by_errors() => Some(Ty::new_error(self.tcx,e)),
             None => None,
         }
     }
@@ -480,7 +485,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             self.tcx,
             cause,
             self.param_env,
-            ty::Binder::dummy(ty::PredicateKind::WellFormed(arg)),
+            ty::Binder::dummy(ty::PredicateKind::Clause(ty::ClauseKind::WellFormed(arg))),
         ));
     }
 
@@ -553,7 +558,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 self.tcx,
                 self.tcx.typeck_root_def_id(expr_def_id.to_def_id()),
             );
-            let witness = self.tcx.mk_generator_witness_mir(expr_def_id.to_def_id(), substs);
+            let witness = Ty::new_generator_witness_mir(self.tcx, expr_def_id.to_def_id(), substs);
 
             // Unify `interior` with `witness` and collect all the resulting obligations.
             let span = self.tcx.hir().body(body_id).value.span;
@@ -644,7 +649,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
 
         self.fulfillment_cx.borrow().pending_obligations().into_iter().filter_map(
             move |obligation| match &obligation.predicate.kind().skip_binder() {
-                ty::PredicateKind::Clause(ty::Clause::Projection(data))
+                ty::PredicateKind::Clause(ty::ClauseKind::Projection(data))
                     if self.self_type_matches_expected_vid(
                         data.projection_ty.self_ty(),
                         ty_var_root,
@@ -652,23 +657,23 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 {
                     Some(obligation)
                 }
-                ty::PredicateKind::Clause(ty::Clause::Trait(data))
+                ty::PredicateKind::Clause(ty::ClauseKind::Trait(data))
                     if self.self_type_matches_expected_vid(data.self_ty(), ty_var_root) =>
                 {
                     Some(obligation)
                 }
 
-                ty::PredicateKind::Clause(ty::Clause::Trait(..))
-                | ty::PredicateKind::Clause(ty::Clause::Projection(..))
-                | ty::PredicateKind::Clause(ty::Clause::ConstArgHasType(..))
+                ty::PredicateKind::Clause(ty::ClauseKind::Trait(..))
+                | ty::PredicateKind::Clause(ty::ClauseKind::Projection(..))
+                | ty::PredicateKind::Clause(ty::ClauseKind::ConstArgHasType(..))
                 | ty::PredicateKind::Subtype(..)
                 | ty::PredicateKind::Coerce(..)
-                | ty::PredicateKind::Clause(ty::Clause::RegionOutlives(..))
-                | ty::PredicateKind::Clause(ty::Clause::TypeOutlives(..))
-                | ty::PredicateKind::WellFormed(..)
+                | ty::PredicateKind::Clause(ty::ClauseKind::RegionOutlives(..))
+                | ty::PredicateKind::Clause(ty::ClauseKind::TypeOutlives(..))
+                | ty::PredicateKind::Clause(ty::ClauseKind::WellFormed(..))
                 | ty::PredicateKind::ObjectSafe(..)
                 | ty::PredicateKind::AliasRelate(..)
-                | ty::PredicateKind::ConstEvaluatable(..)
+                | ty::PredicateKind::Clause(ty::ClauseKind::ConstEvaluatable(..))
                 | ty::PredicateKind::ConstEquate(..)
                 // N.B., this predicate is created by breaking down a
                 // `ClosureType: FnFoo()` predicate, where
@@ -680,7 +685,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 // inference variable.
                 | ty::PredicateKind::ClosureKind(..)
                 | ty::PredicateKind::Ambiguous
-                | ty::PredicateKind::TypeWellFormedFromEnv(..) => None,
+                 => None,
             },
         )
     }
@@ -689,7 +694,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         let sized_did = self.tcx.lang_items().sized_trait();
         self.obligations_for_self_ty(self_ty).any(|obligation| {
             match obligation.predicate.kind().skip_binder() {
-                ty::PredicateKind::Clause(ty::Clause::Trait(data)) => {
+                ty::PredicateKind::Clause(ty::ClauseKind::Trait(data)) => {
                     Some(data.def_id()) == sized_did
                 }
                 _ => false,
@@ -698,7 +703,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
     }
 
     pub(in super::super) fn err_args(&self, len: usize) -> Vec<Ty<'tcx>> {
-        let ty_error = self.tcx.ty_error_misc();
+        let ty_error = Ty::new_misc_error(self.tcx);
         vec![ty_error; len]
     }
 
@@ -743,7 +748,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
 
         let expect_args = self
             .fudge_inference_if_ok(|| {
-                let ocx = ObligationCtxt::new_in_snapshot(self);
+                let ocx = ObligationCtxt::new(self);
 
                 // Attempt to apply a subtyping relationship between the formal
                 // return type (likely containing type variables if the function
@@ -1015,8 +1020,8 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             .typeck_results
             .borrow()
             .expr_ty_adjusted_opt(rcvr)
-            .and_then(|ty| expected.map(|expected_ty| expected_ty.peel_refs() == ty.peel_refs()))
-            .unwrap_or(false);
+            .zip(expected)
+            .is_some_and(|(ty, expected_ty)| expected_ty.peel_refs() == ty.peel_refs());
 
         let prev_call_mutates_and_returns_unit = || {
             self.typeck_results
@@ -1024,14 +1029,13 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 .type_dependent_def_id(expr.hir_id)
                 .map(|def_id| self.tcx.fn_sig(def_id).skip_binder().skip_binder())
                 .and_then(|sig| sig.inputs_and_output.split_last())
-                .map(|(output, inputs)| {
+                .is_some_and(|(output, inputs)| {
                     output.is_unit()
                         && inputs
                             .get(0)
                             .and_then(|self_ty| self_ty.ref_mutability())
-                            .map_or(false, rustc_ast::Mutability::is_mut)
+                            .is_some_and(rustc_ast::Mutability::is_mut)
                 })
-                .unwrap_or(false)
         };
 
         if !(rcvr_has_the_expected_type || prev_call_mutates_and_returns_unit()) {
@@ -1150,7 +1154,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         );
 
         if let Res::Local(hid) = res {
-            let ty = self.local_ty(span, hid).decl_ty;
+            let ty = self.local_ty(span, hid);
             let ty = self.normalize(span, ty);
             self.write_ty(hir_id, ty);
             return (ty, res);
@@ -1198,16 +1202,20 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             }
         }
 
-        let has_self = path_segs
-            .last()
-            .map(|PathSeg(def_id, _)| tcx.generics_of(*def_id).has_self)
-            .unwrap_or(false);
+        let has_self =
+            path_segs.last().is_some_and(|PathSeg(def_id, _)| tcx.generics_of(*def_id).has_self);
 
         let (res, self_ctor_substs) = if let Res::SelfCtor(impl_def_id) = res {
             let ty = self.handle_raw_ty(span, tcx.at(span).type_of(impl_def_id).subst_identity());
             match ty.normalized.ty_adt_def() {
                 Some(adt_def) if adt_def.has_ctor() => {
                     let (ctor_kind, ctor_def_id) = adt_def.non_enum_variant().ctor.unwrap();
+                    // Check the visibility of the ctor.
+                    let vis = tcx.visibility(ctor_def_id);
+                    if !vis.is_accessible_from(tcx.parent_module(hir_id).to_def_id(), tcx) {
+                        tcx.sess
+                            .emit_err(CtorIsPrivate { span, def: tcx.def_path_str(adt_def.did()) });
+                    }
                     let new_res = Res::Def(DefKind::Ctor(CtorOf::Struct, ctor_kind), ctor_def_id);
                     let user_substs = Self::user_substs_for_adt(ty);
                     user_self_ty = user_substs.user_self_ty;
@@ -1234,7 +1242,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                         }
                     }
                     let reported = err.emit();
-                    return (tcx.ty_error(reported), res);
+                    return (Ty::new_error(tcx, reported), res);
                 }
             }
         } else {
@@ -1380,7 +1388,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         // the referenced item.
         let ty = tcx.type_of(def_id);
         assert!(!substs.has_escaping_bound_vars());
-        assert!(!ty.0.has_escaping_bound_vars());
+        assert!(!ty.skip_binder().has_escaping_bound_vars());
         let ty_substituted = self.normalize(span, ty.subst(tcx, substs));
 
         if let Some(UserSelfTy { impl_def_id, self_ty }) = user_self_ty {
@@ -1459,11 +1467,43 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         }
     }
 
-    /// Resolves `typ` by a single level if `typ` is a type variable.
+    /// Try to resolve `ty` to a structural type, normalizing aliases.
+    ///
+    /// In case there is still ambiguity, the returned type may be an inference
+    /// variable. This is different from `structurally_resolve_type` which errors
+    /// in this case.
+    pub fn try_structurally_resolve_type(&self, sp: Span, ty: Ty<'tcx>) -> Ty<'tcx> {
+        let ty = self.resolve_vars_with_obligations(ty);
+
+        if self.next_trait_solver()
+            && let ty::Alias(ty::Projection, _) = ty.kind()
+        {
+            match self
+                .at(&self.misc(sp), self.param_env)
+                .structurally_normalize(ty, &mut **self.fulfillment_cx.borrow_mut())
+            {
+                Ok(normalized_ty) => normalized_ty,
+                Err(errors) => {
+                    let guar = self.err_ctxt().report_fulfillment_errors(&errors);
+                    return Ty::new_error(self.tcx,guar);
+                }
+            }
+        } else {
+            ty
+       }
+    }
+
+    /// Resolves `ty` by a single level if `ty` is a type variable.
+    ///
+    /// When the new solver is enabled, this will also attempt to normalize
+    /// the type if it's a projection (note that it will not deeply normalize
+    /// projections within the type, just the outermost layer of the type).
+    ///
     /// If no resolution is possible, then an error is reported.
     /// Numeric inference variables may be left unresolved.
-    pub fn structurally_resolved_type(&self, sp: Span, ty: Ty<'tcx>) -> Ty<'tcx> {
-        let ty = self.resolve_vars_with_obligations(ty);
+    pub fn structurally_resolve_type(&self, sp: Span, ty: Ty<'tcx>) -> Ty<'tcx> {
+        let ty = self.try_structurally_resolve_type(sp, ty);
+
         if !ty.is_ty_var() {
             ty
         } else {
@@ -1472,7 +1512,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     .emit_inference_failure_err(self.body_id, sp, ty.into(), E0282, true)
                     .emit()
             });
-            let err = self.tcx.ty_error(e);
+            let err = Ty::new_error(self.tcx, e);
             self.demand_suptype(sp, err, ty);
             err
         }

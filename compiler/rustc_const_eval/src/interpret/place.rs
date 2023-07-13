@@ -9,6 +9,7 @@ use rustc_index::IndexSlice;
 use rustc_middle::mir;
 use rustc_middle::ty;
 use rustc_middle::ty::layout::{LayoutOf, TyAndLayout};
+use rustc_middle::ty::Ty;
 use rustc_target::abi::{self, Abi, Align, FieldIdx, HasDataLayout, Size, FIRST_VARIANT};
 
 use super::{
@@ -327,7 +328,8 @@ where
         };
 
         let mplace = MemPlace { ptr: ptr.to_pointer(self)?, meta };
-        // When deref'ing a pointer, the *static* alignment given by the type is what matters.
+        // `ref_to_mplace` is called on raw pointers even if they don't actually get dereferenced;
+        // we hence can't call `size_and_align_of` since that asserts more validity than we want.
         let align = layout.align.abi;
         Ok(MPlaceTy { mplace, layout, align })
     }
@@ -353,34 +355,37 @@ where
     #[inline]
     pub(super) fn get_place_alloc(
         &self,
-        place: &MPlaceTy<'tcx, M::Provenance>,
+        mplace: &MPlaceTy<'tcx, M::Provenance>,
     ) -> InterpResult<'tcx, Option<AllocRef<'_, 'tcx, M::Provenance, M::AllocExtra, M::Bytes>>>
     {
-        assert!(place.layout.is_sized());
-        assert!(!place.meta.has_meta());
-        let size = place.layout.size;
-        self.get_ptr_alloc(place.ptr, size, place.align)
+        let (size, _align) = self
+            .size_and_align_of_mplace(&mplace)?
+            .unwrap_or((mplace.layout.size, mplace.layout.align.abi));
+        // Due to packed places, only `mplace.align` matters.
+        self.get_ptr_alloc(mplace.ptr, size, mplace.align)
     }
 
     #[inline]
     pub(super) fn get_place_alloc_mut(
         &mut self,
-        place: &MPlaceTy<'tcx, M::Provenance>,
+        mplace: &MPlaceTy<'tcx, M::Provenance>,
     ) -> InterpResult<'tcx, Option<AllocRefMut<'_, 'tcx, M::Provenance, M::AllocExtra, M::Bytes>>>
     {
-        assert!(place.layout.is_sized());
-        assert!(!place.meta.has_meta());
-        let size = place.layout.size;
-        self.get_ptr_alloc_mut(place.ptr, size, place.align)
+        let (size, _align) = self
+            .size_and_align_of_mplace(&mplace)?
+            .unwrap_or((mplace.layout.size, mplace.layout.align.abi));
+        // Due to packed places, only `mplace.align` matters.
+        self.get_ptr_alloc_mut(mplace.ptr, size, mplace.align)
     }
 
     /// Check if this mplace is dereferenceable and sufficiently aligned.
     pub fn check_mplace(&self, mplace: MPlaceTy<'tcx, M::Provenance>) -> InterpResult<'tcx> {
-        let (size, align) = self
+        let (size, _align) = self
             .size_and_align_of_mplace(&mplace)?
             .unwrap_or((mplace.layout.size, mplace.layout.align.abi));
-        assert!(mplace.align <= align, "dynamic alignment less strict than static one?");
-        let align = if M::enforce_alignment(self).should_check() { align } else { Align::ONE };
+        // Due to packed places, only `mplace.align` matters.
+        let align =
+            if M::enforce_alignment(self).should_check() { mplace.align } else { Align::ONE };
         self.check_ptr_access_align(mplace.ptr, size, align, CheckInAllocMsg::DerefTest)?;
         Ok(())
     }
@@ -395,7 +400,7 @@ where
         // (Transmuting is okay since this is an in-memory place. We also double-check the size
         // stays the same.)
         let (len, e_ty) = mplace.layout.ty.simd_size_and_type(*self.tcx);
-        let array = self.tcx.mk_array(e_ty, len);
+        let array = Ty::new_array(self.tcx.tcx, e_ty, len);
         let layout = self.layout_of(array)?;
         assert_eq!(layout.size, mplace.layout.size);
         Ok((MPlaceTy { layout, ..*mplace }, len))
@@ -699,8 +704,13 @@ where
             assert_eq!(src.layout.size, dest.layout.size);
         }
 
+        // Setting `nonoverlapping` here only has an effect when we don't hit the fast-path above,
+        // but that should at least match what LLVM does where `memcpy` is also only used when the
+        // type does not have Scalar/ScalarPair layout.
+        // (Or as the `Assign` docs put it, assignments "not producing primitives" must be
+        // non-overlapping.)
         self.mem_copy(
-            src.ptr, src.align, dest.ptr, dest.align, dest_size, /*nonoverlapping*/ false,
+            src.ptr, src.align, dest.ptr, dest.align, dest_size, /*nonoverlapping*/ true,
         )
     }
 
@@ -775,7 +785,8 @@ where
         let meta = Scalar::from_target_usize(u64::try_from(str.len()).unwrap(), self);
         let mplace = MemPlace { ptr: ptr.into(), meta: MemPlaceMeta::Meta(meta) };
 
-        let ty = self.tcx.mk_ref(
+        let ty = Ty::new_ref(
+            self.tcx.tcx,
             self.tcx.lifetimes.re_static,
             ty::TypeAndMut { ty: self.tcx.types.str_, mutbl },
         );

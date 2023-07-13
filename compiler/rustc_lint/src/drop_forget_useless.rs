@@ -1,13 +1,17 @@
 use rustc_hir::{Arm, Expr, ExprKind, Node};
+use rustc_middle::ty;
 use rustc_span::sym;
 
 use crate::{
-    lints::{DropCopyDiag, DropRefDiag, ForgetCopyDiag, ForgetRefDiag},
+    lints::{
+        DropCopyDiag, DropRefDiag, ForgetCopyDiag, ForgetRefDiag, UndroppedManuallyDropsDiag,
+        UndroppedManuallyDropsSuggestion,
+    },
     LateContext, LateLintPass, LintContext,
 };
 
 declare_lint! {
-    /// The `drop_ref` lint checks for calls to `std::mem::drop` with a reference
+    /// The `dropping_references` lint checks for calls to `std::mem::drop` with a reference
     /// instead of an owned value.
     ///
     /// ### Example
@@ -29,13 +33,13 @@ declare_lint! {
     /// reference itself, which is a no-op. It will not call the `drop` method (from
     /// the `Drop` trait implementation) on the underlying referenced value, which
     /// is likely what was intended.
-    pub DROP_REF,
+    pub DROPPING_REFERENCES,
     Warn,
     "calls to `std::mem::drop` with a reference instead of an owned value"
 }
 
 declare_lint! {
-    /// The `forget_ref` lint checks for calls to `std::mem::forget` with a reference
+    /// The `forgetting_references` lint checks for calls to `std::mem::forget` with a reference
     /// instead of an owned value.
     ///
     /// ### Example
@@ -52,13 +56,13 @@ declare_lint! {
     /// Calling `forget` on a reference will only forget the
     /// reference itself, which is a no-op. It will not forget the underlying
     /// referenced value, which is likely what was intended.
-    pub FORGET_REF,
+    pub FORGETTING_REFERENCES,
     Warn,
     "calls to `std::mem::forget` with a reference instead of an owned value"
 }
 
 declare_lint! {
-    /// The `drop_copy` lint checks for calls to `std::mem::drop` with a value
+    /// The `dropping_copy_types` lint checks for calls to `std::mem::drop` with a value
     /// that derives the Copy trait.
     ///
     /// ### Example
@@ -76,13 +80,13 @@ declare_lint! {
     /// Calling `std::mem::drop` [does nothing for types that
     /// implement Copy](https://doc.rust-lang.org/std/mem/fn.drop.html), since the
     /// value will be copied and moved into the function on invocation.
-    pub DROP_COPY,
+    pub DROPPING_COPY_TYPES,
     Warn,
     "calls to `std::mem::drop` with a value that implements Copy"
 }
 
 declare_lint! {
-    /// The `forget_copy` lint checks for calls to `std::mem::forget` with a value
+    /// The `forgetting_copy_types` lint checks for calls to `std::mem::forget` with a value
     /// that derives the Copy trait.
     ///
     /// ### Example
@@ -104,12 +108,34 @@ declare_lint! {
     /// An alternative, but also valid, explanation is that Copy types do not
     /// implement the Drop trait, which means they have no destructors. Without a
     /// destructor, there is nothing for `std::mem::forget` to ignore.
-    pub FORGET_COPY,
+    pub FORGETTING_COPY_TYPES,
     Warn,
     "calls to `std::mem::forget` with a value that implements Copy"
 }
 
-declare_lint_pass!(DropForgetUseless => [DROP_REF, FORGET_REF, DROP_COPY, FORGET_COPY]);
+declare_lint! {
+    /// The `undropped_manually_drops` lint check for calls to `std::mem::drop` with
+    /// a value of `std::mem::ManuallyDrop` which doesn't drop.
+    ///
+    /// ### Example
+    ///
+    /// ```rust,compile_fail
+    /// struct S;
+    /// drop(std::mem::ManuallyDrop::new(S));
+    /// ```
+    ///
+    /// {{produces}}
+    ///
+    /// ### Explanation
+    ///
+    /// `ManuallyDrop` does not drop it's inner value so calling `std::mem::drop` will
+    /// not drop the inner value of the `ManuallyDrop` either.
+    pub UNDROPPED_MANUALLY_DROPS,
+    Deny,
+    "calls to `std::mem::drop` with `std::mem::ManuallyDrop` instead of it's inner value"
+}
+
+declare_lint_pass!(DropForgetUseless => [DROPPING_REFERENCES, FORGETTING_REFERENCES, DROPPING_COPY_TYPES, FORGETTING_COPY_TYPES, UNDROPPED_MANUALLY_DROPS]);
 
 impl<'tcx> LateLintPass<'tcx> for DropForgetUseless {
     fn check_expr(&mut self, cx: &LateContext<'tcx>, expr: &'tcx Expr<'tcx>) {
@@ -123,16 +149,30 @@ impl<'tcx> LateLintPass<'tcx> for DropForgetUseless {
             let drop_is_single_call_in_arm = is_single_call_in_arm(cx, arg, expr);
             match fn_name {
                 sym::mem_drop if arg_ty.is_ref() && !drop_is_single_call_in_arm => {
-                    cx.emit_spanned_lint(DROP_REF, expr.span, DropRefDiag { arg_ty, label: arg.span });
+                    cx.emit_spanned_lint(DROPPING_REFERENCES, expr.span, DropRefDiag { arg_ty, label: arg.span });
                 },
                 sym::mem_forget if arg_ty.is_ref() => {
-                    cx.emit_spanned_lint(FORGET_REF, expr.span, ForgetRefDiag { arg_ty, label: arg.span });
+                    cx.emit_spanned_lint(FORGETTING_REFERENCES, expr.span, ForgetRefDiag { arg_ty, label: arg.span });
                 },
                 sym::mem_drop if is_copy && !drop_is_single_call_in_arm => {
-                    cx.emit_spanned_lint(DROP_COPY, expr.span, DropCopyDiag { arg_ty, label: arg.span });
+                    cx.emit_spanned_lint(DROPPING_COPY_TYPES, expr.span, DropCopyDiag { arg_ty, label: arg.span });
                 }
                 sym::mem_forget if is_copy => {
-                    cx.emit_spanned_lint(FORGET_COPY, expr.span, ForgetCopyDiag { arg_ty, label: arg.span });
+                    cx.emit_spanned_lint(FORGETTING_COPY_TYPES, expr.span, ForgetCopyDiag { arg_ty, label: arg.span });
+                }
+                sym::mem_drop if let ty::Adt(adt, _) = arg_ty.kind() && adt.is_manually_drop() => {
+                    cx.emit_spanned_lint(
+                        UNDROPPED_MANUALLY_DROPS,
+                        expr.span,
+                        UndroppedManuallyDropsDiag {
+                            arg_ty,
+                            label: arg.span,
+                            suggestion: UndroppedManuallyDropsSuggestion {
+                                start_span: arg.span.shrink_to_lo(),
+                                end_span: arg.span.shrink_to_hi()
+                            }
+                        }
+                    );
                 }
                 _ => return,
             };
@@ -154,7 +194,7 @@ fn is_single_call_in_arm<'tcx>(
     arg: &'tcx Expr<'_>,
     drop_expr: &'tcx Expr<'_>,
 ) -> bool {
-    if matches!(arg.kind, ExprKind::Call(..) | ExprKind::MethodCall(..)) {
+    if arg.can_have_side_effects() {
         let parent_node = cx.tcx.hir().find_parent(drop_expr.hir_id);
         if let Some(Node::Arm(Arm { body, .. })) = &parent_node {
             return body.hir_id == drop_expr.hir_id;

@@ -123,13 +123,7 @@ impl<'a, 'tcx> MirBorrowckCtxt<'a, 'tcx> {
                     item_msg = access_place_desc;
                     debug_assert!(self.body.local_decls[ty::CAPTURE_STRUCT_LOCAL].ty.is_ref());
                     debug_assert!(is_closure_or_generator(
-                        Place::ty_from(
-                            the_place_err.local,
-                            the_place_err.projection,
-                            self.body,
-                            self.infcx.tcx
-                        )
-                        .ty
+                        the_place_err.ty(self.body, self.infcx.tcx).ty
                     ));
 
                     reason = if self.is_upvar_field_projection(access_place.as_ref()).is_some() {
@@ -234,7 +228,7 @@ impl<'a, 'tcx> MirBorrowckCtxt<'a, 'tcx> {
                     borrow_spans.var_subdiag(
                     None,
                     &mut err,
-                    Some(mir::BorrowKind::Mut { allow_two_phase_borrow: false }),
+                    Some(mir::BorrowKind::Mut { kind: mir::MutBorrowKind::Default }),
                     |_kind, var_span| {
                         let place = self.describe_any_place(access_place.as_ref());
                         crate::session_diagnostics::CaptureVarCause::MutableBorrowUsePlaceClosure {
@@ -289,8 +283,7 @@ impl<'a, 'tcx> MirBorrowckCtxt<'a, 'tcx> {
                     .body
                     .local_decls
                     .get(local)
-                    .map(|l| mut_borrow_of_mutable_ref(l, self.local_names[local]))
-                    .unwrap_or(false) =>
+                    .is_some_and(|l| mut_borrow_of_mutable_ref(l, self.local_names[local])) =>
             {
                 let decl = &self.body.local_decls[local];
                 err.span_label(span, format!("cannot {act}"));
@@ -301,7 +294,7 @@ impl<'a, 'tcx> MirBorrowckCtxt<'a, 'tcx> {
                             _,
                             mir::Rvalue::Ref(
                                 _,
-                                mir::BorrowKind::Mut { allow_two_phase_borrow: false },
+                                mir::BorrowKind::Mut { kind: mir::MutBorrowKind::Default },
                                 _,
                             ),
                         )),
@@ -417,12 +410,28 @@ impl<'a, 'tcx> MirBorrowckCtxt<'a, 'tcx> {
                         _,
                     ) = pat.kind
                 {
-                    err.span_suggestion(
-                        upvar_ident.span,
-                        "consider changing this to be mutable",
-                        format!("mut {}", upvar_ident.name),
-                        Applicability::MachineApplicable,
-                    );
+                    if upvar_ident.name == kw::SelfLower {
+                        for (_, node) in self.infcx.tcx.hir().parent_iter(upvar_hir_id) {
+                            if let Some(fn_decl) = node.fn_decl() {
+                                if !matches!(fn_decl.implicit_self, hir::ImplicitSelfKind::ImmRef | hir::ImplicitSelfKind::MutRef) {
+                                    err.span_suggestion(
+                                        upvar_ident.span,
+                                        "consider changing this to be mutable",
+                                        format!("mut {}", upvar_ident.name),
+                                        Applicability::MachineApplicable,
+                                    );
+                                    break;
+                                }
+                            }
+                        }
+                    } else {
+                        err.span_suggestion(
+                            upvar_ident.span,
+                            "consider changing this to be mutable",
+                            format!("mut {}", upvar_ident.name),
+                            Applicability::MachineApplicable,
+                        );
+                    }
                 }
 
                 let tcx = self.infcx.tcx;
@@ -443,7 +452,7 @@ impl<'a, 'tcx> MirBorrowckCtxt<'a, 'tcx> {
                     .sess
                     .source_map()
                     .span_to_snippet(span)
-                    .map_or(false, |snippet| snippet.starts_with("&mut ")) =>
+                    .is_ok_and(|snippet| snippet.starts_with("&mut ")) =>
             {
                 err.span_label(span, format!("cannot {act}"));
                 err.span_suggestion(
@@ -642,13 +651,8 @@ impl<'a, 'tcx> MirBorrowckCtxt<'a, 'tcx> {
             let Some(hir::Node::Item(item)) = node else { return; };
             let hir::ItemKind::Fn(.., body_id) = item.kind else { return; };
             let body = self.infcx.tcx.hir().body(body_id);
-            let mut assign_span = span;
-            // Drop desugaring is done at MIR build so it's not in the HIR
-            if let Some(DesugaringKind::Replace) = span.desugaring_kind() {
-                assign_span.remove_mark();
-            }
 
-            let mut v = V { assign_span, err, ty, suggested: false };
+            let mut v = V { assign_span: span, err, ty, suggested: false };
             v.visit_body(body);
             if !v.suggested {
                 err.help(format!(

@@ -26,7 +26,8 @@ struct Cache {
     predecessors: OnceCell<Predecessors>,
     switch_sources: OnceCell<SwitchSources>,
     is_cyclic: OnceCell<bool>,
-    postorder: OnceCell<Vec<BasicBlock>>,
+    reverse_postorder: OnceCell<Vec<BasicBlock>>,
+    dominators: OnceCell<Dominators<BasicBlock>>,
 }
 
 impl<'tcx> BasicBlocks<'tcx> {
@@ -41,8 +42,8 @@ impl<'tcx> BasicBlocks<'tcx> {
         *self.cache.is_cyclic.get_or_init(|| graph::is_cyclic(self))
     }
 
-    pub fn dominators(&self) -> Dominators<BasicBlock> {
-        dominators(&self)
+    pub fn dominators(&self) -> &Dominators<BasicBlock> {
+        self.cache.dominators.get_or_init(|| dominators(self))
     }
 
     /// Returns predecessors for each basic block.
@@ -61,11 +62,14 @@ impl<'tcx> BasicBlocks<'tcx> {
         })
     }
 
-    /// Returns basic blocks in a postorder.
+    /// Returns basic blocks in a reverse postorder.
     #[inline]
-    pub fn postorder(&self) -> &[BasicBlock] {
-        self.cache.postorder.get_or_init(|| {
-            Postorder::new(&self.basic_blocks, START_BLOCK).map(|(bb, _)| bb).collect()
+    pub fn reverse_postorder(&self) -> &[BasicBlock] {
+        self.cache.reverse_postorder.get_or_init(|| {
+            let mut rpo: Vec<_> =
+                Postorder::new(&self.basic_blocks, START_BLOCK).map(|(bb, _)| bb).collect();
+            rpo.reverse();
+            rpo
         })
     }
 

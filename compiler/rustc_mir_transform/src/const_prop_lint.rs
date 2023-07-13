@@ -9,6 +9,7 @@ use rustc_const_eval::interpret::Immediate;
 use rustc_const_eval::interpret::{
     self, InterpCx, InterpResult, LocalValue, MemoryKind, OpTy, Scalar, StackPopCleanup,
 };
+use rustc_const_eval::ReportErrorExt;
 use rustc_hir::def::DefKind;
 use rustc_hir::HirId;
 use rustc_index::bit_set::BitSet;
@@ -232,7 +233,7 @@ impl<'mir, 'tcx> ConstPropagator<'mir, 'tcx> {
                 op
             }
             Err(e) => {
-                trace!("get_const failed: {}", e);
+                trace!("get_const failed: {:?}", e.into_kind().debug());
                 return None;
             }
         };
@@ -272,8 +273,7 @@ impl<'mir, 'tcx> ConstPropagator<'mir, 'tcx> {
                 // dedicated error variants should be introduced instead.
                 assert!(
                     !error.kind().formatted_string(),
-                    "const-prop encountered formatting error: {}",
-                    error
+                    "const-prop encountered formatting error: {error:?}",
                 );
                 None
             }
@@ -363,7 +363,7 @@ impl<'mir, 'tcx> ConstPropagator<'mir, 'tcx> {
             let left_size = self.ecx.layout_of(left_ty).ok()?.size;
             let right_size = r.layout.size;
             let r_bits = r.to_scalar().to_bits(right_size).ok();
-            if r_bits.map_or(false, |b| b >= left_size.bits() as u128) {
+            if r_bits.is_some_and(|b| b >= left_size.bits() as u128) {
                 debug!("check_binary_op: reporting assert for {:?}", location);
                 let source_info = self.body().source_info(location);
                 let panic = AssertKind::Overflow(

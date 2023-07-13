@@ -238,6 +238,7 @@ impl<'a> DerefMut for SnapshotParser<'a> {
 
 impl<'a> Parser<'a> {
     #[rustc_lint_diagnostics]
+    #[track_caller]
     pub fn struct_span_err<S: Into<MultiSpan>>(
         &self,
         sp: S,
@@ -604,6 +605,22 @@ impl<'a> Parser<'a> {
             }
         }
 
+        if let TokenKind::Ident(prev, _) = &self.prev_token.kind
+          && let TokenKind::Ident(cur, _) = &self.token.kind
+        {
+                let concat = Symbol::intern(&format!("{}{}", prev, cur));
+                let ident = Ident::new(concat, DUMMY_SP);
+                if ident.is_used_keyword() || ident.is_reserved() || ident.is_raw_guess() {
+                    let span = self.prev_token.span.to(self.token.span);
+                    err.span_suggestion_verbose(
+                        span,
+                        format!("consider removing the space to spell keyword `{}`", concat),
+                        concat,
+                        Applicability::MachineApplicable,
+                    );
+                }
+        }
+
         // `pub` may be used for an item or `pub(crate)`
         if self.prev_token.is_ident_named(sym::public)
             && (self.token.can_begin_item()
@@ -750,13 +767,24 @@ impl<'a> Parser<'a> {
                     tail.could_be_bare_literal = true;
                     if maybe_struct_name.is_ident() && can_be_struct_literal {
                         // Account for `if Example { a: one(), }.is_pos() {}`.
-                        Err(self.sess.create_err(StructLiteralNeedingParens {
-                            span: maybe_struct_name.span.to(expr.span),
-                            sugg: StructLiteralNeedingParensSugg {
-                                before: maybe_struct_name.span.shrink_to_lo(),
-                                after: expr.span.shrink_to_hi(),
-                            },
-                        }))
+                        // expand `before` so that we take care of module path such as:
+                        // `foo::Bar { ... } `
+                        // we expect to suggest `(foo::Bar { ... })` instead of `foo::(Bar { ... })`
+                        let sm = self.sess.source_map();
+                        let before = maybe_struct_name.span.shrink_to_lo();
+                        if let Ok(extend_before) = sm.span_extend_prev_while(before, |t| {
+                            t.is_alphanumeric() || t == ':' || t == '_'
+                        }) {
+                            Err(self.sess.create_err(StructLiteralNeedingParens {
+                                span: maybe_struct_name.span.to(expr.span),
+                                sugg: StructLiteralNeedingParensSugg {
+                                    before: extend_before.shrink_to_lo(),
+                                    after: expr.span.shrink_to_hi(),
+                                },
+                            }))
+                        } else {
+                            return None;
+                        }
                     } else {
                         self.sess.emit_err(StructLiteralBodyWithoutPath {
                             span: expr.span,
@@ -844,7 +872,7 @@ impl<'a> Parser<'a> {
         //
         // `x.foo::<u32>>>(3)`
         let parsed_angle_bracket_args =
-            segment.args.as_ref().map_or(false, |args| args.is_angle_bracketed());
+            segment.args.as_ref().is_some_and(|args| args.is_angle_bracketed());
 
         debug!(
             "check_trailing_angle_brackets: parsed_angle_bracket_args={:?}",
@@ -2609,7 +2637,7 @@ impl<'a> Parser<'a> {
         let TyKind::Path(qself, path) = &ty.kind else { return Ok(()) };
         let qself_position = qself.as_ref().map(|qself| qself.position);
         for (i, segments) in path.segments.windows(2).enumerate() {
-            if qself_position.map(|pos| i < pos).unwrap_or(false) {
+            if qself_position.is_some_and(|pos| i < pos) {
                 continue;
             }
             if let [a, b] = segments {

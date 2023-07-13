@@ -18,7 +18,7 @@ extern crate rustc_interface;
 extern crate rustc_middle;
 extern crate rustc_session;
 
-use rustc_borrowck::consumers::BodyWithBorrowckFacts;
+use rustc_borrowck::consumers::{self, BodyWithBorrowckFacts, ConsumerOptions};
 use rustc_driver::Compilation;
 use rustc_hir::def::DefKind;
 use rustc_hir::def_id::LocalDefId;
@@ -27,7 +27,7 @@ use rustc_interface::{Config, Queries};
 use rustc_middle::query::queries::mir_borrowck::ProvidedValue;
 use rustc_middle::query::{ExternProviders, Providers};
 use rustc_middle::ty::TyCtxt;
-use rustc_session::Session;
+use rustc_session::{Session, EarlyErrorHandler};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::thread_local;
@@ -58,6 +58,7 @@ impl rustc_driver::Callbacks for CompilerCalls {
     // the result.
     fn after_analysis<'tcx>(
         &mut self,
+        _handler: &EarlyErrorHandler,
         compiler: &Compiler,
         queries: &'tcx Queries<'tcx>,
     ) -> Compilation {
@@ -102,7 +103,7 @@ impl rustc_driver::Callbacks for CompilerCalls {
             println!("Bodies retrieved for:");
             for (def_id, body) in bodies {
                 println!("{}", def_id);
-                assert!(body.input_facts.cfg_edge.len() > 0);
+                assert!(body.input_facts.unwrap().cfg_edge.len() > 0);
             }
         });
 
@@ -127,7 +128,8 @@ thread_local! {
 }
 
 fn mir_borrowck<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId) -> ProvidedValue<'tcx> {
-    let body_with_facts = rustc_borrowck::consumers::get_body_with_borrowck_facts(tcx, def_id);
+    let opts = ConsumerOptions::PoloniusInputFacts;
+    let body_with_facts = consumers::get_body_with_borrowck_facts(tcx, def_id, opts);
     // SAFETY: The reader casts the 'static lifetime to 'tcx before using it.
     let body_with_facts: BodyWithBorrowckFacts<'static> =
         unsafe { std::mem::transmute(body_with_facts) };

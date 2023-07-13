@@ -432,11 +432,9 @@ pub(crate) fn codegen_terminator_call<'tcx>(
     let is_cold = if fn_sig.abi() == Abi::RustCold {
         true
     } else {
-        instance
-            .map(|inst| {
-                fx.tcx.codegen_fn_attrs(inst.def_id()).flags.contains(CodegenFnAttrFlags::COLD)
-            })
-            .unwrap_or(false)
+        instance.is_some_and(|inst| {
+            fx.tcx.codegen_fn_attrs(inst.def_id()).flags.contains(CodegenFnAttrFlags::COLD)
+        })
     };
     if is_cold {
         fx.bcx.set_cold_block(fx.bcx.current_block().unwrap());
@@ -470,7 +468,7 @@ pub(crate) fn codegen_terminator_call<'tcx>(
     };
 
     // Pass the caller location for `#[track_caller]`.
-    if instance.map(|inst| inst.def.requires_caller_location(fx.tcx)).unwrap_or(false) {
+    if instance.is_some_and(|inst| inst.def.requires_caller_location(fx.tcx)) {
         let caller_location = fx.get_caller_location(source_info);
         args.push(CallArgument { value: caller_location, is_owned: false });
     }
@@ -667,7 +665,8 @@ pub(crate) fn codegen_drop<'tcx>(
 
                 let arg_value = drop_place.place_ref(
                     fx,
-                    fx.layout_of(fx.tcx.mk_ref(
+                    fx.layout_of(Ty::new_ref(
+                        fx.tcx,
                         fx.tcx.lifetimes.re_erased,
                         TypeAndMut { ty, mutbl: crate::rustc_hir::Mutability::Mut },
                     )),

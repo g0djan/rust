@@ -8,6 +8,7 @@ use std::task::Poll;
 use std::thread;
 
 use log::info;
+use rustc_middle::ty::Ty;
 
 use crate::borrow_tracker::RetagFields;
 use crate::diagnostics::report_leaks;
@@ -90,6 +91,10 @@ pub struct MiriConfig {
     pub validate: bool,
     /// Determines if Stacked Borrows or Tree Borrows is enabled.
     pub borrow_tracker: Option<BorrowTrackerMethod>,
+    /// Whether `core::ptr::Unique` receives special treatment.
+    /// If `true` then `Unique` is reborrowed with its own new tag and permission,
+    /// otherwise `Unique` is just another raw pointer.
+    pub unique_is_unique: bool,
     /// Controls alignment checking.
     pub check_alignment: AlignmentCheck,
     /// Controls function [ABI](Abi) checking.
@@ -156,6 +161,7 @@ impl Default for MiriConfig {
             env: vec![],
             validate: true,
             borrow_tracker: Some(BorrowTrackerMethod::StackedBorrows),
+            unique_is_unique: false,
             check_alignment: AlignmentCheck::Int,
             check_abi: true,
             isolated_op: IsolatedOp::Reject(RejectOpWith::Abort),
@@ -299,7 +305,7 @@ pub fn create_ecx<'mir, 'tcx: 'mir>(
         for arg in config.args.iter() {
             // Make space for `0` terminator.
             let size = u64::try_from(arg.len()).unwrap().checked_add(1).unwrap();
-            let arg_type = tcx.mk_array(tcx.types.u8, size);
+            let arg_type = Ty::new_array(tcx, tcx.types.u8, size);
             let arg_place =
                 ecx.allocate(ecx.layout_of(arg_type)?, MiriMemoryKind::Machine.into())?;
             ecx.write_os_str_to_c_str(OsStr::new(arg), arg_place.ptr, size)?;
@@ -307,9 +313,11 @@ pub fn create_ecx<'mir, 'tcx: 'mir>(
             argvs.push(arg_place.to_ref(&ecx));
         }
         // Make an array with all these pointers, in the Miri memory.
-        let argvs_layout = ecx.layout_of(
-            tcx.mk_array(tcx.mk_imm_ptr(tcx.types.u8), u64::try_from(argvs.len()).unwrap()),
-        )?;
+        let argvs_layout = ecx.layout_of(Ty::new_array(
+            tcx,
+            Ty::new_imm_ptr(tcx, tcx.types.u8),
+            u64::try_from(argvs.len()).unwrap(),
+        ))?;
         let argvs_place = ecx.allocate(argvs_layout, MiriMemoryKind::Machine.into())?;
         for (idx, arg) in argvs.into_iter().enumerate() {
             let place = ecx.mplace_field(&argvs_place, idx)?;
@@ -327,7 +335,7 @@ pub fn create_ecx<'mir, 'tcx: 'mir>(
             ecx.machine.argc = Some(*argc_place);
 
             let argv_place = ecx.allocate(
-                ecx.layout_of(tcx.mk_imm_ptr(tcx.types.unit))?,
+                ecx.layout_of(Ty::new_imm_ptr(tcx, tcx.types.unit))?,
                 MiriMemoryKind::Machine.into(),
             )?;
             ecx.write_immediate(argv, &argv_place.into())?;
@@ -339,7 +347,8 @@ pub fn create_ecx<'mir, 'tcx: 'mir>(
             // Construct a command string with all the arguments.
             let cmd_utf16: Vec<u16> = args_to_utf16_command_string(config.args.iter());
 
-            let cmd_type = tcx.mk_array(tcx.types.u16, u64::try_from(cmd_utf16.len()).unwrap());
+            let cmd_type =
+                Ty::new_array(tcx, tcx.types.u16, u64::try_from(cmd_utf16.len()).unwrap());
             let cmd_place =
                 ecx.allocate(ecx.layout_of(cmd_type)?, MiriMemoryKind::Machine.into())?;
             ecx.machine.cmd_line = Some(*cmd_place);
@@ -360,7 +369,11 @@ pub fn create_ecx<'mir, 'tcx: 'mir>(
 
     match entry_type {
         EntryFnType::Main { .. } => {
-            let start_id = tcx.lang_items().start_fn().unwrap();
+            let start_id = tcx.lang_items().start_fn().unwrap_or_else(|| {
+                tcx.sess.fatal(
+                    "could not find start function. Make sure the entry point is marked with `#[start]`."
+                );
+            });
             let main_ret_ty = tcx.fn_sig(entry_id).no_bound_vars().unwrap().output();
             let main_ret_ty = main_ret_ty.no_bound_vars().unwrap();
             let start_instance = ty::Instance::resolve(
@@ -422,8 +435,9 @@ pub fn eval_entry<'tcx>(
     let mut ecx = match create_ecx(tcx, entry_id, entry_type, &config) {
         Ok(v) => v,
         Err(err) => {
-            err.print_backtrace();
-            panic!("Miri initialization error: {}", err.kind())
+            let (kind, backtrace) = err.into_parts();
+            backtrace.print_backtrace();
+            panic!("Miri initialization error: {kind:?}")
         }
     };
 

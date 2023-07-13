@@ -12,7 +12,7 @@ use rustc_parse::maybe_new_parser_from_source_str;
 use rustc_parse::parser::attr::InnerAttrPolicy;
 use rustc_session::config::{self, CrateType, ErrorOutputType};
 use rustc_session::parse::ParseSess;
-use rustc_session::{lint, Session};
+use rustc_session::{lint, EarlyErrorHandler, Session};
 use rustc_span::edition::Edition;
 use rustc_span::source_map::SourceMap;
 use rustc_span::symbol::sym;
@@ -85,13 +85,18 @@ pub(crate) fn run(options: RustdocOptions) -> Result<(), ErrorGuaranteed> {
         ..config::Options::default()
     };
 
+    let early_error_handler = EarlyErrorHandler::new(ErrorOutputType::default());
+
     let mut cfgs = options.cfgs.clone();
     cfgs.push("doc".to_owned());
     cfgs.push("doctest".to_owned());
     let config = interface::Config {
         opts: sessopts,
-        crate_cfg: interface::parse_cfgspecs(cfgs),
-        crate_check_cfg: interface::parse_check_cfg(options.check_cfgs.clone()),
+        crate_cfg: interface::parse_cfgspecs(&early_error_handler, cfgs),
+        crate_check_cfg: interface::parse_check_cfg(
+            &early_error_handler,
+            options.check_cfgs.clone(),
+        ),
         input,
         output_file: None,
         output_dir: None,
@@ -1237,7 +1242,7 @@ impl<'a, 'hir, 'tcx> HirCollector<'a, 'hir, 'tcx> {
         // The collapse-docs pass won't combine sugared/raw doc attributes, or included files with
         // anything else, this will combine them for us.
         let attrs = Attributes::from_ast(ast_attrs);
-        if let Some(doc) = attrs.collapsed_doc_value() {
+        if let Some(doc) = attrs.opt_doc_value() {
             // Use the outermost invocation, so that doctest names come from where the docs were written.
             let span = ast_attrs
                 .iter()

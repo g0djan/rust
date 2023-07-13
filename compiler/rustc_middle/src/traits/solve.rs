@@ -5,20 +5,22 @@ use rustc_query_system::cache::Cache;
 
 use crate::infer::canonical::{CanonicalVarValues, QueryRegionConstraints};
 use crate::traits::query::NoSolution;
-use crate::traits::Canonical;
+use crate::traits::{Canonical, DefiningAnchor};
 use crate::ty::{
     self, FallibleTypeFolder, ToPredicate, Ty, TyCtxt, TypeFoldable, TypeFolder, TypeVisitable,
     TypeVisitor,
 };
 
-pub type EvaluationCache<'tcx> = Cache<CanonicalGoal<'tcx>, QueryResult<'tcx>>;
+pub mod inspect;
+
+pub type EvaluationCache<'tcx> = Cache<CanonicalInput<'tcx>, QueryResult<'tcx>>;
 
 /// A goal is a statement, i.e. `predicate`, we want to prove
 /// given some assumptions, i.e. `param_env`.
 ///
 /// Most of the time the `param_env` contains the `where`-bounds of the function
 /// we're currently typechecking while the `predicate` is some trait bound.
-#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash, TypeFoldable, TypeVisitable)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash, HashStable, TypeFoldable, TypeVisitable)]
 pub struct Goal<'tcx, P> {
     pub predicate: P,
     pub param_env: ty::ParamEnv<'tcx>,
@@ -39,7 +41,7 @@ impl<'tcx, P> Goal<'tcx, P> {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash, TypeFoldable, TypeVisitable)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash, HashStable, TypeFoldable, TypeVisitable)]
 pub struct Response<'tcx> {
     pub certainty: Certainty,
     pub var_values: CanonicalVarValues<'tcx>,
@@ -47,7 +49,7 @@ pub struct Response<'tcx> {
     pub external_constraints: ExternalConstraints<'tcx>,
 }
 
-#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash, TypeFoldable, TypeVisitable)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash, HashStable, TypeFoldable, TypeVisitable)]
 pub enum Certainty {
     Yes,
     Maybe(MaybeCause),
@@ -86,7 +88,7 @@ impl Certainty {
 }
 
 /// Why we failed to evaluate a goal.
-#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash, TypeFoldable, TypeVisitable)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash, HashStable, TypeFoldable, TypeVisitable)]
 pub enum MaybeCause {
     /// We failed due to ambiguity. This ambiguity can either
     /// be a true ambiguity, i.e. there are multiple different answers,
@@ -96,7 +98,31 @@ pub enum MaybeCause {
     Overflow,
 }
 
-pub type CanonicalGoal<'tcx, T = ty::Predicate<'tcx>> = Canonical<'tcx, Goal<'tcx, T>>;
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash, HashStable, TypeFoldable, TypeVisitable)]
+pub struct QueryInput<'tcx, T> {
+    pub goal: Goal<'tcx, T>,
+    pub anchor: DefiningAnchor,
+    pub predefined_opaques_in_body: PredefinedOpaques<'tcx>,
+}
+
+/// Additional constraints returned on success.
+#[derive(Debug, PartialEq, Eq, Clone, Hash, HashStable, Default)]
+pub struct PredefinedOpaquesData<'tcx> {
+    pub opaque_types: Vec<(ty::OpaqueTypeKey<'tcx>, Ty<'tcx>)>,
+}
+
+#[derive(Debug, PartialEq, Eq, Copy, Clone, Hash, HashStable)]
+pub struct PredefinedOpaques<'tcx>(pub(crate) Interned<'tcx, PredefinedOpaquesData<'tcx>>);
+
+impl<'tcx> std::ops::Deref for PredefinedOpaques<'tcx> {
+    type Target = PredefinedOpaquesData<'tcx>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+pub type CanonicalInput<'tcx, T = ty::Predicate<'tcx>> = Canonical<'tcx, QueryInput<'tcx, T>>;
 
 pub type CanonicalResponse<'tcx> = Canonical<'tcx, Response<'tcx>>;
 
@@ -108,7 +134,7 @@ pub type CanonicalResponse<'tcx> = Canonical<'tcx, Response<'tcx>>;
 /// solver, merge the two responses again.
 pub type QueryResult<'tcx> = Result<CanonicalResponse<'tcx>, NoSolution>;
 
-#[derive(Debug, PartialEq, Eq, Copy, Clone, Hash)]
+#[derive(Debug, PartialEq, Eq, Copy, Clone, Hash, HashStable)]
 pub struct ExternalConstraints<'tcx>(pub(crate) Interned<'tcx, ExternalConstraintsData<'tcx>>);
 
 impl<'tcx> std::ops::Deref for ExternalConstraints<'tcx> {
@@ -120,11 +146,11 @@ impl<'tcx> std::ops::Deref for ExternalConstraints<'tcx> {
 }
 
 /// Additional constraints returned on success.
-#[derive(Debug, PartialEq, Eq, Clone, Hash, Default)]
+#[derive(Debug, PartialEq, Eq, Clone, Hash, HashStable, Default)]
 pub struct ExternalConstraintsData<'tcx> {
     // FIXME: implement this.
     pub region_constraints: QueryRegionConstraints<'tcx>,
-    pub opaque_types: Vec<(Ty<'tcx>, Ty<'tcx>)>,
+    pub opaque_types: Vec<(ty::OpaqueTypeKey<'tcx>, Ty<'tcx>)>,
 }
 
 // FIXME: Having to clone `region_constraints` for folding feels bad and
@@ -164,4 +190,47 @@ impl<'tcx> TypeVisitable<TyCtxt<'tcx>> for ExternalConstraints<'tcx> {
         self.opaque_types.visit_with(visitor)?;
         ControlFlow::Continue(())
     }
+}
+
+// FIXME: Having to clone `region_constraints` for folding feels bad and
+// probably isn't great wrt performance.
+//
+// Not sure how to fix this, maybe we should also intern `opaque_types` and
+// `region_constraints` here or something.
+impl<'tcx> TypeFoldable<TyCtxt<'tcx>> for PredefinedOpaques<'tcx> {
+    fn try_fold_with<F: FallibleTypeFolder<TyCtxt<'tcx>>>(
+        self,
+        folder: &mut F,
+    ) -> Result<Self, F::Error> {
+        Ok(FallibleTypeFolder::interner(folder).mk_predefined_opaques_in_body(
+            PredefinedOpaquesData {
+                opaque_types: self
+                    .opaque_types
+                    .iter()
+                    .map(|opaque| opaque.try_fold_with(folder))
+                    .collect::<Result<_, F::Error>>()?,
+            },
+        ))
+    }
+
+    fn fold_with<F: TypeFolder<TyCtxt<'tcx>>>(self, folder: &mut F) -> Self {
+        TypeFolder::interner(folder).mk_predefined_opaques_in_body(PredefinedOpaquesData {
+            opaque_types: self.opaque_types.iter().map(|opaque| opaque.fold_with(folder)).collect(),
+        })
+    }
+}
+
+impl<'tcx> TypeVisitable<TyCtxt<'tcx>> for PredefinedOpaques<'tcx> {
+    fn visit_with<V: TypeVisitor<TyCtxt<'tcx>>>(
+        &self,
+        visitor: &mut V,
+    ) -> std::ops::ControlFlow<V::BreakTy> {
+        self.opaque_types.visit_with(visitor)
+    }
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, HashStable)]
+pub enum IsNormalizesToHack {
+    Yes,
+    No,
 }

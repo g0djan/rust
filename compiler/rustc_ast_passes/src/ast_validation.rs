@@ -348,7 +348,7 @@ impl<'a> AstValidator<'a> {
         let source_map = self.session.source_map();
         let end = source_map.end_point(sp);
 
-        if source_map.span_to_snippet(end).map(|s| s == ";").unwrap_or(false) {
+        if source_map.span_to_snippet(end).is_ok_and(|s| s == ";") {
             end
         } else {
             sp.shrink_to_hi()
@@ -364,7 +364,12 @@ impl<'a> AstValidator<'a> {
         self.err_handler().emit_err(errors::BoundInContext { span, ctx });
     }
 
-    fn check_foreign_ty_genericless(&self, generics: &Generics, where_span: Span) {
+    fn check_foreign_ty_genericless(
+        &self,
+        generics: &Generics,
+        before_where_clause: &TyAliasWhereClause,
+        after_where_clause: &TyAliasWhereClause,
+    ) {
         let cannot_have = |span, descr, remove_descr| {
             self.err_handler().emit_err(errors::ExternTypesCannotHave {
                 span,
@@ -378,9 +383,14 @@ impl<'a> AstValidator<'a> {
             cannot_have(generics.span, "generic parameters", "generic parameters");
         }
 
-        if !generics.where_clause.predicates.is_empty() {
-            cannot_have(where_span, "`where` clauses", "`where` clause");
-        }
+        let check_where_clause = |where_clause: &TyAliasWhereClause| {
+            if let TyAliasWhereClause(true, where_clause_span) = where_clause {
+                cannot_have(*where_clause_span, "`where` clauses", "`where` clause");
+            }
+        };
+
+        check_where_clause(before_where_clause);
+        check_where_clause(after_where_clause);
     }
 
     fn check_foreign_kind_bodyless(&self, ident: Ident, kind: &str, body: Option<Span>) {
@@ -613,13 +623,12 @@ impl<'a> AstValidator<'a> {
     fn maybe_lint_missing_abi(&mut self, span: Span, id: NodeId) {
         // FIXME(davidtwco): This is a hack to detect macros which produce spans of the
         // call site which do not have a macro backtrace. See #61963.
-        let is_macro_callsite = self
+        if self
             .session
             .source_map()
             .span_to_snippet(span)
-            .map(|snippet| snippet.starts_with("#["))
-            .unwrap_or(true);
-        if !is_macro_callsite {
+            .is_ok_and(|snippet| !snippet.starts_with("#["))
+        {
             self.lint_buffer.buffer_lint_with_diagnostic(
                 MISSING_ABI,
                 id,
@@ -736,11 +745,10 @@ impl<'a> Visitor<'a> for AstValidator<'a> {
                         this.visit_expr(&arm.body);
                         this.visit_pat(&arm.pat);
                         walk_list!(this, visit_attribute, &arm.attrs);
-                        if let Some(guard) = &arm.guard && let ExprKind::Let(_, guard_expr, _) = &guard.kind {
+                        if let Some(guard) = &arm.guard {
                             this.with_let_management(None, |this, _| {
-                                this.visit_expr(guard_expr)
+                                this.visit_expr(guard)
                             });
-                            return;
                         }
                     }
                 }
@@ -1040,7 +1048,7 @@ impl<'a> Visitor<'a> for AstValidator<'a> {
                 self.check_defaultness(fi.span, *defaultness);
                 self.check_foreign_kind_bodyless(fi.ident, "type", ty.as_ref().map(|b| b.span));
                 self.check_type_no_bounds(bounds, "`extern` blocks");
-                self.check_foreign_ty_genericless(generics, where_clauses.0.1);
+                self.check_foreign_ty_genericless(generics, &where_clauses.0, &where_clauses.1);
                 self.check_foreign_item_ascii_only(fi.ident);
             }
             ForeignItemKind::Static(_, _, body) => {
@@ -1292,14 +1300,7 @@ impl<'a> Visitor<'a> for AstValidator<'a> {
                         });
                     }
                 }
-                AssocItemKind::Type(box TyAlias {
-                    generics,
-                    where_clauses,
-                    where_predicates_split,
-                    bounds,
-                    ty,
-                    ..
-                }) => {
+                AssocItemKind::Type(box TyAlias { bounds, ty, .. }) => {
                     if ty.is_none() {
                         self.session.emit_err(errors::AssocTypeWithoutBody {
                             span: item.span,
@@ -1307,16 +1308,24 @@ impl<'a> Visitor<'a> for AstValidator<'a> {
                         });
                     }
                     self.check_type_no_bounds(bounds, "`impl`s");
-                    if ty.is_some() {
-                        self.check_gat_where(
-                            item.id,
-                            generics.where_clause.predicates.split_at(*where_predicates_split).0,
-                            *where_clauses,
-                        );
-                    }
                 }
                 _ => {}
             }
+        }
+
+        if let AssocItemKind::Type(box TyAlias {
+            generics,
+            where_clauses,
+            where_predicates_split,
+            ty: Some(_),
+            ..
+        }) = &item.kind
+        {
+            self.check_gat_where(
+                item.id,
+                generics.where_clause.predicates.split_at(*where_predicates_split).0,
+                *where_clauses,
+            );
         }
 
         if ctxt == AssocCtxt::Trait || self.in_trait_impl {

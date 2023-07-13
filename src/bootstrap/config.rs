@@ -10,19 +10,20 @@ use std::cell::{Cell, RefCell};
 use std::cmp;
 use std::collections::{HashMap, HashSet};
 use std::env;
-use std::fmt;
+use std::fmt::{self, Display};
 use std::fs;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::str::FromStr;
 
-use crate::builder::TaskPath;
 use crate::cache::{Interned, INTERNER};
 use crate::cc_detect::{ndk_compiler, Language};
 use crate::channel::{self, GitInfo};
 pub use crate::flags::Subcommand;
 use crate::flags::{Color, Flags, Warnings};
 use crate::util::{exe, output, t};
+use build_helper::detail_exit_macro;
 use once_cell::sync::OnceCell;
 use semver::Version;
 use serde::{Deserialize, Deserializer};
@@ -47,6 +48,57 @@ pub enum DryRun {
     SelfCheck,
     /// This is a dry run enabled by the `--dry-run` flag.
     UserSelected,
+}
+
+#[derive(Copy, Clone, Default)]
+pub enum DebuginfoLevel {
+    #[default]
+    None,
+    LineTablesOnly,
+    Limited,
+    Full,
+}
+
+// NOTE: can't derive(Deserialize) because the intermediate trip through toml::Value only
+// deserializes i64, and derive() only generates visit_u64
+impl<'de> Deserialize<'de> for DebuginfoLevel {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        use serde::de::Error;
+
+        Ok(match Deserialize::deserialize(deserializer)? {
+            StringOrInt::String("none") | StringOrInt::Int(0) => DebuginfoLevel::None,
+            StringOrInt::String("line-tables-only") => DebuginfoLevel::LineTablesOnly,
+            StringOrInt::String("limited") | StringOrInt::Int(1) => DebuginfoLevel::Limited,
+            StringOrInt::String("full") | StringOrInt::Int(2) => DebuginfoLevel::Full,
+            StringOrInt::Int(n) => {
+                let other = serde::de::Unexpected::Signed(n);
+                return Err(D::Error::invalid_value(other, &"expected 0, 1, or 2"));
+            }
+            StringOrInt::String(s) => {
+                let other = serde::de::Unexpected::Str(s);
+                return Err(D::Error::invalid_value(
+                    other,
+                    &"expected none, line-tables-only, limited, or full",
+                ));
+            }
+        })
+    }
+}
+
+/// Suitable for passing to `-C debuginfo`
+impl Display for DebuginfoLevel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        use DebuginfoLevel::*;
+        f.write_str(match self {
+            None => "0",
+            LineTablesOnly => "line-tables-only",
+            Limited => "1",
+            Full => "2",
+        })
+    }
 }
 
 /// Global configuration for the entire build and/or bootstrap.
@@ -78,7 +130,7 @@ pub struct Config {
     pub sanitizers: bool,
     pub profiler: bool,
     pub omit_git_hash: bool,
-    pub exclude: Vec<TaskPath>,
+    pub exclude: Vec<PathBuf>,
     pub include_default_paths: bool,
     pub rustc_error_format: Option<String>,
     pub json_output: bool,
@@ -150,7 +202,7 @@ pub struct Config {
     pub llvm_use_libcxx: bool,
 
     // rust codegen options
-    pub rust_optimize: bool,
+    pub rust_optimize: RustOptimize,
     pub rust_codegen_units: Option<u32>,
     pub rust_codegen_units_std: Option<u32>,
     pub rust_debug_assertions: bool,
@@ -158,10 +210,10 @@ pub struct Config {
     pub rust_overflow_checks: bool,
     pub rust_overflow_checks_std: bool,
     pub rust_debug_logging: bool,
-    pub rust_debuginfo_level_rustc: u32,
-    pub rust_debuginfo_level_std: u32,
-    pub rust_debuginfo_level_tools: u32,
-    pub rust_debuginfo_level_tests: u32,
+    pub rust_debuginfo_level_rustc: DebuginfoLevel,
+    pub rust_debuginfo_level_std: DebuginfoLevel,
+    pub rust_debuginfo_level_tools: DebuginfoLevel,
+    pub rust_debuginfo_level_tests: DebuginfoLevel,
     pub rust_split_debuginfo: SplitDebuginfo,
     pub rust_rpath: bool,
     pub rustc_parallel: bool,
@@ -350,7 +402,7 @@ impl SplitDebuginfo {
 }
 
 /// LTO mode used for compiling rustc itself.
-#[derive(Default, Clone, PartialEq)]
+#[derive(Default, Clone, PartialEq, Debug)]
 pub enum RustcLto {
     Off,
     #[default]
@@ -377,6 +429,7 @@ impl std::str::FromStr for RustcLto {
 pub struct TargetSelection {
     pub triple: Interned<String>,
     file: Option<Interned<String>>,
+    synthetic: bool,
 }
 
 /// Newtype over `Vec<TargetSelection>` so we can implement custom parsing logic
@@ -408,7 +461,15 @@ impl TargetSelection {
         let triple = INTERNER.intern_str(triple);
         let file = file.map(|f| INTERNER.intern_str(f));
 
-        Self { triple, file }
+        Self { triple, file, synthetic: false }
+    }
+
+    pub fn create_synthetic(triple: &str, file: &str) -> Self {
+        Self {
+            triple: INTERNER.intern_str(triple),
+            file: Some(INTERNER.intern_str(file)),
+            synthetic: true,
+        }
     }
 
     pub fn rustc_target_arg(&self) -> &str {
@@ -425,6 +486,11 @@ impl TargetSelection {
 
     pub fn ends_with(&self, needle: &str) -> bool {
         self.triple.ends_with(needle)
+    }
+
+    // See src/bootstrap/synthetic_targets.rs
+    pub fn is_synthetic(&self) -> bool {
+        self.synthetic
     }
 }
 
@@ -508,29 +574,42 @@ struct TomlConfig {
     profile: Option<String>,
 }
 
+/// Describes how to handle conflicts in merging two [`TomlConfig`]
+#[derive(Copy, Clone, Debug)]
+enum ReplaceOpt {
+    /// Silently ignore a duplicated value
+    IgnoreDuplicate,
+    /// Override the current value, even if it's `Some`
+    Override,
+    /// Exit with an error on duplicate values
+    ErrorOnDuplicate,
+}
+
 trait Merge {
-    fn merge(&mut self, other: Self);
+    fn merge(&mut self, other: Self, replace: ReplaceOpt);
 }
 
 impl Merge for TomlConfig {
     fn merge(
         &mut self,
-        TomlConfig { build, install, llvm, rust, dist, target, profile: _, changelog_seen: _ }: Self,
+        TomlConfig { build, install, llvm, rust, dist, target, profile: _, changelog_seen }: Self,
+        replace: ReplaceOpt,
     ) {
-        fn do_merge<T: Merge>(x: &mut Option<T>, y: Option<T>) {
+        fn do_merge<T: Merge>(x: &mut Option<T>, y: Option<T>, replace: ReplaceOpt) {
             if let Some(new) = y {
                 if let Some(original) = x {
-                    original.merge(new);
+                    original.merge(new, replace);
                 } else {
                     *x = Some(new);
                 }
             }
         }
-        do_merge(&mut self.build, build);
-        do_merge(&mut self.install, install);
-        do_merge(&mut self.llvm, llvm);
-        do_merge(&mut self.rust, rust);
-        do_merge(&mut self.dist, dist);
+        self.changelog_seen.merge(changelog_seen, replace);
+        do_merge(&mut self.build, build, replace);
+        do_merge(&mut self.install, install, replace);
+        do_merge(&mut self.llvm, llvm, replace);
+        do_merge(&mut self.rust, rust, replace);
+        do_merge(&mut self.dist, dist, replace);
         assert!(target.is_none(), "merging target-specific config is not currently supported");
     }
 }
@@ -547,10 +626,33 @@ macro_rules! define_config {
         }
 
         impl Merge for $name {
-            fn merge(&mut self, other: Self) {
+            fn merge(&mut self, other: Self, replace: ReplaceOpt) {
                 $(
-                    if !self.$field.is_some() {
-                        self.$field = other.$field;
+                    match replace {
+                        ReplaceOpt::IgnoreDuplicate => {
+                            if self.$field.is_none() {
+                                self.$field = other.$field;
+                            }
+                        },
+                        ReplaceOpt::Override => {
+                            if other.$field.is_some() {
+                                self.$field = other.$field;
+                            }
+                        }
+                        ReplaceOpt::ErrorOnDuplicate => {
+                            if other.$field.is_some() {
+                                if self.$field.is_some() {
+                                    if cfg!(test) {
+                                        panic!("overriding existing option")
+                                    } else {
+                                        eprintln!("overriding existing option: `{}`", stringify!($field));
+                                        detail_exit_macro!(2);
+                                    }
+                                } else {
+                                    self.$field = other.$field;
+                                }
+                            }
+                        }
                     }
                 )*
             }
@@ -618,6 +720,37 @@ macro_rules! define_config {
                     FIELDS,
                     Field,
                 )
+            }
+        }
+    }
+}
+
+impl<T> Merge for Option<T> {
+    fn merge(&mut self, other: Self, replace: ReplaceOpt) {
+        match replace {
+            ReplaceOpt::IgnoreDuplicate => {
+                if self.is_none() {
+                    *self = other;
+                }
+            }
+            ReplaceOpt::Override => {
+                if other.is_some() {
+                    *self = other;
+                }
+            }
+            ReplaceOpt::ErrorOnDuplicate => {
+                if other.is_some() {
+                    if self.is_some() {
+                        if cfg!(test) {
+                            panic!("overriding existing option")
+                        } else {
+                            eprintln!("overriding existing option");
+                            detail_exit_macro!(2);
+                        }
+                    } else {
+                        *self = other;
+                    }
+                }
             }
         }
     }
@@ -742,10 +875,102 @@ impl Default for StringOrBool {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RustOptimize {
+    String(String),
+    Int(u8),
+    Bool(bool),
+}
+
+impl Default for RustOptimize {
+    fn default() -> RustOptimize {
+        RustOptimize::Bool(false)
+    }
+}
+
+impl<'de> Deserialize<'de> for RustOptimize {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_any(OptimizeVisitor)
+    }
+}
+
+struct OptimizeVisitor;
+
+impl<'de> serde::de::Visitor<'de> for OptimizeVisitor {
+    type Value = RustOptimize;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(r#"one of: 0, 1, 2, 3, "s", "z", true, false"#)
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        if ["s", "z"].iter().find(|x| **x == value).is_some() {
+            Ok(RustOptimize::String(value.to_string()))
+        } else {
+            Err(format_optimize_error_msg(value)).map_err(serde::de::Error::custom)
+        }
+    }
+
+    fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        if matches!(value, 0..=3) {
+            Ok(RustOptimize::Int(value as u8))
+        } else {
+            Err(format_optimize_error_msg(value)).map_err(serde::de::Error::custom)
+        }
+    }
+
+    fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(RustOptimize::Bool(value))
+    }
+}
+
+fn format_optimize_error_msg(v: impl std::fmt::Display) -> String {
+    format!(
+        r#"unrecognized option for rust optimize: "{}", expected one of 0, 1, 2, 3, "s", "z", true, false"#,
+        v
+    )
+}
+
+impl RustOptimize {
+    pub(crate) fn is_release(&self) -> bool {
+        match &self {
+            RustOptimize::Bool(true) | RustOptimize::String(_) => true,
+            RustOptimize::Int(i) => *i > 0,
+            RustOptimize::Bool(false) => false,
+        }
+    }
+
+    pub(crate) fn get_opt_level(&self) -> Option<String> {
+        match &self {
+            RustOptimize::String(s) => Some(s.clone()),
+            RustOptimize::Int(i) => Some(i.to_string()),
+            RustOptimize::Bool(_) => None,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum StringOrInt<'a> {
+    String(&'a str),
+    Int(i64),
+}
 define_config! {
     /// TOML representation of how the Rust build is configured.
     struct Rust {
-        optimize: Option<bool> = "optimize",
+        optimize: Option<RustOptimize> = "optimize",
         debug: Option<bool> = "debug",
         codegen_units: Option<u32> = "codegen-units",
         codegen_units_std: Option<u32> = "codegen-units-std",
@@ -754,11 +979,11 @@ define_config! {
         overflow_checks: Option<bool> = "overflow-checks",
         overflow_checks_std: Option<bool> = "overflow-checks-std",
         debug_logging: Option<bool> = "debug-logging",
-        debuginfo_level: Option<u32> = "debuginfo-level",
-        debuginfo_level_rustc: Option<u32> = "debuginfo-level-rustc",
-        debuginfo_level_std: Option<u32> = "debuginfo-level-std",
-        debuginfo_level_tools: Option<u32> = "debuginfo-level-tools",
-        debuginfo_level_tests: Option<u32> = "debuginfo-level-tests",
+        debuginfo_level: Option<DebuginfoLevel> = "debuginfo-level",
+        debuginfo_level_rustc: Option<DebuginfoLevel> = "debuginfo-level-rustc",
+        debuginfo_level_std: Option<DebuginfoLevel> = "debuginfo-level-std",
+        debuginfo_level_tools: Option<DebuginfoLevel> = "debuginfo-level-tools",
+        debuginfo_level_tests: Option<DebuginfoLevel> = "debuginfo-level-tests",
         split_debuginfo: Option<String> = "split-debuginfo",
         run_dsymutil: Option<bool> = "run-dsymutil",
         backtrace: Option<bool> = "backtrace",
@@ -826,14 +1051,12 @@ define_config! {
 
 impl Config {
     pub fn default_opts() -> Config {
-        use is_terminal::IsTerminal;
-
         let mut config = Config::default();
         config.llvm_optimize = true;
         config.ninja_in_file = true;
         config.llvm_static_stdcpp = false;
         config.backtrace = true;
-        config.rust_optimize = true;
+        config.rust_optimize = RustOptimize::Bool(true);
         config.rust_optimize_tests = true;
         config.submodules = None;
         config.docs = true;
@@ -864,34 +1087,33 @@ impl Config {
 
     pub fn parse(args: &[String]) -> Config {
         #[cfg(test)]
-        let get_toml = |_: &_| TomlConfig::default();
+        fn get_toml(_: &Path) -> TomlConfig {
+            TomlConfig::default()
+        }
+
         #[cfg(not(test))]
-        let get_toml = |file: &Path| {
+        fn get_toml(file: &Path) -> TomlConfig {
             let contents =
                 t!(fs::read_to_string(file), format!("config file {} not found", file.display()));
             // Deserialize to Value and then TomlConfig to prevent the Deserialize impl of
             // TomlConfig and sub types to be monomorphized 5x by toml.
-            match toml::from_str(&contents)
+            toml::from_str(&contents)
                 .and_then(|table: toml::Value| TomlConfig::deserialize(table))
-            {
-                Ok(table) => table,
-                Err(err) => {
-                    eprintln!("failed to parse TOML configuration '{}': {}", file.display(), err);
-                    crate::detail_exit(2);
-                }
-            }
-        };
-
+                .unwrap_or_else(|err| {
+                    eprintln!("failed to parse TOML configuration '{}': {err}", file.display());
+                    detail_exit_macro!(2);
+                })
+        }
         Self::parse_inner(args, get_toml)
     }
 
-    fn parse_inner<'a>(args: &[String], get_toml: impl 'a + Fn(&Path) -> TomlConfig) -> Config {
+    fn parse_inner(args: &[String], get_toml: impl Fn(&Path) -> TomlConfig) -> Config {
         let mut flags = Flags::parse(&args);
         let mut config = Config::default_opts();
 
         // Set flags.
         config.paths = std::mem::take(&mut flags.paths);
-        config.exclude = flags.exclude.into_iter().map(|path| TaskPath::parse(path)).collect();
+        config.exclude = flags.exclude;
         config.include_default_paths = flags.include_default_paths;
         config.rustc_error_format = flags.rustc_error_format;
         config.json_output = flags.json_output;
@@ -913,7 +1135,7 @@ impl Config {
             eprintln!(
                 "Cannot use both `llvm_bolt_profile_generate` and `llvm_bolt_profile_use` at the same time"
             );
-            crate::detail_exit(1);
+            detail_exit_macro!(1);
         }
 
         // Infer the rest of the configuration.
@@ -992,14 +1214,54 @@ impl Config {
         };
 
         if let Some(include) = &toml.profile {
+            // Allows creating alias for profile names, allowing
+            // profiles to be renamed while maintaining back compatibility
+            // Keep in sync with `profile_aliases` in bootstrap.py
+            let profile_aliases = HashMap::from([("user", "dist")]);
+            let include = match profile_aliases.get(include.as_str()) {
+                Some(alias) => alias,
+                None => include.as_str(),
+            };
             let mut include_path = config.src.clone();
             include_path.push("src");
             include_path.push("bootstrap");
             include_path.push("defaults");
             include_path.push(format!("config.{}.toml", include));
             let included_toml = get_toml(&include_path);
-            toml.merge(included_toml);
+            toml.merge(included_toml, ReplaceOpt::IgnoreDuplicate);
         }
+
+        let mut override_toml = TomlConfig::default();
+        for option in flags.set.iter() {
+            fn get_table(option: &str) -> Result<TomlConfig, toml::de::Error> {
+                toml::from_str(&option)
+                    .and_then(|table: toml::Value| TomlConfig::deserialize(table))
+            }
+
+            let mut err = match get_table(option) {
+                Ok(v) => {
+                    override_toml.merge(v, ReplaceOpt::ErrorOnDuplicate);
+                    continue;
+                }
+                Err(e) => e,
+            };
+            // We want to be able to set string values without quotes,
+            // like in `configure.py`. Try adding quotes around the right hand side
+            if let Some((key, value)) = option.split_once("=") {
+                if !value.contains('"') {
+                    match get_table(&format!(r#"{key}="{value}""#)) {
+                        Ok(v) => {
+                            override_toml.merge(v, ReplaceOpt::ErrorOnDuplicate);
+                            continue;
+                        }
+                        Err(e) => err = e,
+                    }
+                }
+            }
+            eprintln!("failed to parse override `{option}`: `{err}");
+            detail_exit_macro!(2)
+        }
+        toml.merge(override_toml, ReplaceOpt::Override);
 
         config.changelog_seen = toml.changelog_seen;
 
@@ -1016,10 +1278,13 @@ impl Config {
             config.out = crate::util::absolute(&config.out);
         }
 
-        config.initial_rustc = build.rustc.map(PathBuf::from).unwrap_or_else(|| {
+        config.initial_rustc = if let Some(rustc) = build.rustc {
+            config.check_build_rustc_version(&rustc);
+            PathBuf::from(rustc)
+        } else {
             config.download_beta_toolchain();
             config.out.join(config.build.triple).join("stage0/bin/rustc")
-        });
+        };
 
         config.initial_cargo = build
             .cargo
@@ -1110,6 +1375,25 @@ impl Config {
         let mut omit_git_hash = None;
 
         if let Some(rust) = toml.rust {
+            set(&mut config.channel, rust.channel);
+
+            config.download_rustc_commit = config.download_ci_rustc_commit(rust.download_rustc);
+            // This list is incomplete, please help by expanding it!
+            if config.download_rustc_commit.is_some() {
+                // We need the channel used by the downloaded compiler to match the one we set for rustdoc;
+                // otherwise rustdoc-ui tests break.
+                let ci_channel = t!(fs::read_to_string(config.src.join("src/ci/channel")));
+                let ci_channel = ci_channel.trim_end();
+                if config.channel != ci_channel
+                    && !(config.channel == "dev" && ci_channel == "nightly")
+                {
+                    panic!(
+                        "setting rust.channel={} is incompatible with download-rustc",
+                        config.channel
+                    );
+                }
+            }
+
             debug = rust.debug;
             debug_assertions = rust.debug_assertions;
             debug_assertions_std = rust.debug_assertions_std;
@@ -1121,6 +1405,7 @@ impl Config {
             debuginfo_level_std = rust.debuginfo_level_std;
             debuginfo_level_tools = rust.debuginfo_level_tools;
             debuginfo_level_tests = rust.debuginfo_level_tests;
+
             config.rust_split_debuginfo = rust
                 .split_debuginfo
                 .as_deref()
@@ -1136,7 +1421,6 @@ impl Config {
             set(&mut config.jemalloc, rust.jemalloc);
             set(&mut config.test_compare_mode, rust.test_compare_mode);
             set(&mut config.backtrace, rust.backtrace);
-            set(&mut config.channel, rust.channel);
             config.description = rust.description;
             set(&mut config.rust_dist_src, rust.dist_src);
             set(&mut config.verbose_tests, rust.verbose_tests);
@@ -1177,8 +1461,6 @@ impl Config {
             config.rust_codegen_units_std = rust.codegen_units_std.map(threads_from_config);
             config.rust_profile_use = flags.rust_profile_use.or(rust.profile_use);
             config.rust_profile_generate = flags.rust_profile_generate.or(rust.profile_generate);
-            config.download_rustc_commit = config.download_ci_rustc_commit(rust.download_rustc);
-
             config.rust_lto = rust
                 .lto
                 .as_deref()
@@ -1290,6 +1572,11 @@ impl Config {
                 let mut target = Target::from_triple(&triple);
 
                 if let Some(ref s) = cfg.llvm_config {
+                    if config.download_rustc_commit.is_some() && triple == &*config.build.triple {
+                        panic!(
+                            "setting llvm_config for the host is incompatible with download-rustc"
+                        );
+                    }
                     target.llvm_config = Some(config.src.join(s));
                 }
                 target.llvm_has_rust_patches = cfg.llvm_has_rust_patches;
@@ -1366,7 +1653,7 @@ impl Config {
         config.llvm_assertions = llvm_assertions.unwrap_or(false);
         config.llvm_tests = llvm_tests.unwrap_or(false);
         config.llvm_plugins = llvm_plugins.unwrap_or(false);
-        config.rust_optimize = optimize.unwrap_or(true);
+        config.rust_optimize = optimize.unwrap_or(RustOptimize::Bool(true));
 
         let default = debug == Some(true);
         config.rust_debug_assertions = debug_assertions.unwrap_or(default);
@@ -1378,17 +1665,17 @@ impl Config {
 
         config.rust_debug_logging = debug_logging.unwrap_or(config.rust_debug_assertions);
 
-        let with_defaults = |debuginfo_level_specific: Option<u32>| {
+        let with_defaults = |debuginfo_level_specific: Option<_>| {
             debuginfo_level_specific.or(debuginfo_level).unwrap_or(if debug == Some(true) {
-                1
+                DebuginfoLevel::Limited
             } else {
-                0
+                DebuginfoLevel::None
             })
         };
         config.rust_debuginfo_level_rustc = with_defaults(debuginfo_level_rustc);
         config.rust_debuginfo_level_std = with_defaults(debuginfo_level_std);
         config.rust_debuginfo_level_tools = with_defaults(debuginfo_level_tools);
-        config.rust_debuginfo_level_tests = debuginfo_level_tests.unwrap_or(0);
+        config.rust_debuginfo_level_tests = debuginfo_level_tests.unwrap_or(DebuginfoLevel::None);
 
         let download_rustc = config.download_rustc_commit.is_some();
         // See https://github.com/rust-lang/compiler-team/issues/326
@@ -1560,6 +1847,12 @@ impl Config {
         self.out.join(&*self.build.triple).join("ci-llvm")
     }
 
+    /// Directory where the extracted `rustc-dev` component is stored.
+    pub(crate) fn ci_rustc_dir(&self) -> PathBuf {
+        assert!(self.download_rustc());
+        self.out.join(self.build.triple).join("ci-rustc")
+    }
+
     /// Determine whether llvm should be linked dynamically.
     ///
     /// If `false`, llvm should be linked statically.
@@ -1595,11 +1888,11 @@ impl Config {
         self.download_rustc_commit().is_some()
     }
 
-    pub(crate) fn download_rustc_commit(&self) -> Option<&'static str> {
+    pub(crate) fn download_rustc_commit(&self) -> Option<&str> {
         static DOWNLOAD_RUSTC: OnceCell<Option<String>> = OnceCell::new();
         if self.dry_run() && DOWNLOAD_RUSTC.get().is_none() {
             // avoid trying to actually download the commit
-            return None;
+            return self.download_rustc_commit.as_deref();
         }
 
         DOWNLOAD_RUSTC
@@ -1682,13 +1975,13 @@ impl Config {
         self.rust_codegen_backends.get(0).cloned()
     }
 
-    pub fn check_build_rustc_version(&self) {
+    pub fn check_build_rustc_version(&self, rustc_path: &str) {
         if self.dry_run() {
             return;
         }
 
         // check rustc version is same or lower with 1 apart from the building one
-        let mut cmd = Command::new(&self.initial_rustc);
+        let mut cmd = Command::new(rustc_path);
         cmd.arg("--version");
         let rustc_output = output(&mut cmd)
             .lines()
@@ -1714,7 +2007,7 @@ impl Config {
                 "Unexpected rustc version: {}, we should use {}/{} to build source with {}",
                 rustc_version, prev_version, source_version, source_version
             );
-            crate::detail_exit(1);
+            detail_exit_macro!(1);
         }
     }
 
@@ -1750,7 +2043,7 @@ impl Config {
             println!("help: maybe your repository history is too shallow?");
             println!("help: consider disabling `download-rustc`");
             println!("help: or fetch enough history to include one upstream commit");
-            crate::detail_exit(1);
+            crate::detail_exit_macro!(1);
         }
 
         // Warn if there were changes to the compiler or standard library since the ancestor commit.

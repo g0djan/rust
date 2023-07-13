@@ -220,7 +220,7 @@ impl<'tcx> Printer<'tcx> for &mut SymbolPrinter<'tcx> {
         match *ty.kind() {
             // Print all nominal types as paths (unlike `pretty_print_type`).
             ty::FnDef(def_id, substs)
-            | ty::Alias(_, ty::AliasTy { def_id, substs, .. })
+            | ty::Alias(ty::Projection | ty::Opaque, ty::AliasTy { def_id, substs, .. })
             | ty::Closure(def_id, substs)
             | ty::Generator(def_id, substs, _) => self.print_def_path(def_id, substs),
 
@@ -230,7 +230,7 @@ impl<'tcx> Printer<'tcx> for &mut SymbolPrinter<'tcx> {
                 self.write_str("[")?;
                 self = self.print_type(ty)?;
                 self.write_str("; ")?;
-                if let Some(size) = size.kind().try_to_bits(self.tcx().data_layout.pointer_size) {
+                if let Some(size) = size.try_to_bits(self.tcx().data_layout.pointer_size) {
                     write!(self, "{size}")?
                 } else if let ty::ConstKind::Param(param) = size.kind() {
                     self = param.print(self)?
@@ -240,6 +240,8 @@ impl<'tcx> Printer<'tcx> for &mut SymbolPrinter<'tcx> {
                 self.write_str("]")?;
                 Ok(self)
             }
+
+            ty::Alias(ty::Inherent, _) => panic!("unexpected inherent projection"),
 
             _ => self.pretty_print_type(ty),
         }

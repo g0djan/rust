@@ -31,6 +31,7 @@ mod macros;
 mod structural_impls;
 
 pub use codec::*;
+pub use structural_impls::{DebugWithInfcx, InferCtxtLike, OptWithInfcx};
 pub use sty::*;
 pub use ty_info::*;
 
@@ -39,34 +40,45 @@ pub trait HashStableContext {}
 
 pub trait Interner: Sized {
     type AdtDef: Clone + Debug + Hash + Ord;
-    type SubstsRef: Clone + Debug + Hash + Ord;
+    type SubstsRef: Clone + DebugWithInfcx<Self> + Hash + Ord;
     type DefId: Clone + Debug + Hash + Ord;
     type Binder<T>;
-    type Ty: Clone + Debug + Hash + Ord;
-    type Const: Clone + Debug + Hash + Ord;
-    type Region: Clone + Debug + Hash + Ord;
+    type Ty: Clone + DebugWithInfcx<Self> + Hash + Ord;
+    type Const: Clone + DebugWithInfcx<Self> + Hash + Ord;
+    type Region: Clone + DebugWithInfcx<Self> + Hash + Ord;
     type Predicate;
     type TypeAndMut: Clone + Debug + Hash + Ord;
     type Mutability: Clone + Debug + Hash + Ord;
     type Movability: Clone + Debug + Hash + Ord;
-    type PolyFnSig: Clone + Debug + Hash + Ord;
-    type ListBinderExistentialPredicate: Clone + Debug + Hash + Ord;
-    type BinderListTy: Clone + Debug + Hash + Ord;
-    type ListTy: Clone + Debug + Hash + Ord;
-    type AliasTy: Clone + Debug + Hash + Ord;
+    type PolyFnSig: Clone + DebugWithInfcx<Self> + Hash + Ord;
+    type ListBinderExistentialPredicate: Clone + DebugWithInfcx<Self> + Hash + Ord;
+    type BinderListTy: Clone + DebugWithInfcx<Self> + Hash + Ord;
+    type ListTy: Clone + Debug + Hash + Ord + IntoIterator<Item = Self::Ty>;
+    type AliasTy: Clone + DebugWithInfcx<Self> + Hash + Ord;
     type ParamTy: Clone + Debug + Hash + Ord;
     type BoundTy: Clone + Debug + Hash + Ord;
     type PlaceholderType: Clone + Debug + Hash + Ord;
-    type InferTy: Clone + Debug + Hash + Ord;
+    type InferTy: Clone + DebugWithInfcx<Self> + Hash + Ord;
     type ErrorGuaranteed: Clone + Debug + Hash + Ord;
     type PredicateKind: Clone + Debug + Hash + PartialEq + Eq;
     type AllocId: Clone + Debug + Hash + Ord;
 
+    type InferConst: Clone + DebugWithInfcx<Self> + Hash + Ord;
+    type AliasConst: Clone + DebugWithInfcx<Self> + Hash + Ord;
+    type PlaceholderConst: Clone + Debug + Hash + Ord;
+    type ParamConst: Clone + Debug + Hash + Ord;
+    type BoundConst: Clone + Debug + Hash + Ord;
+    type ValueConst: Clone + Debug + Hash + Ord;
+    type ExprConst: Clone + DebugWithInfcx<Self> + Hash + Ord;
+
     type EarlyBoundRegion: Clone + Debug + Hash + Ord;
     type BoundRegion: Clone + Debug + Hash + Ord;
     type FreeRegion: Clone + Debug + Hash + Ord;
-    type RegionVid: Clone + Debug + Hash + Ord;
+    type RegionVid: Clone + DebugWithInfcx<Self> + Hash + Ord;
     type PlaceholderRegion: Clone + Debug + Hash + Ord;
+
+    fn ty_and_mut_to_parts(ty_and_mut: Self::TypeAndMut) -> (Self::Ty, Self::Mutability);
+    fn mutability_is_mut(mutbl: Self::Mutability) -> bool;
 }
 
 /// Imagine you have a function `F: FnOnce(&[T]) -> R`, plus an iterator `iter`
@@ -390,7 +402,19 @@ impl DebruijnIndex {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub fn debug_bound_var<T: std::fmt::Write>(
+    fmt: &mut T,
+    debruijn: DebruijnIndex,
+    var: impl std::fmt::Debug,
+) -> Result<(), std::fmt::Error> {
+    if debruijn == INNERMOST {
+        write!(fmt, "^{:?}", var)
+    } else {
+        write!(fmt, "^{}_{:?}", debruijn.index(), var)
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[derive(Encodable, Decodable, HashStable_Generic)]
 pub enum IntTy {
     Isize,
@@ -448,7 +472,7 @@ impl IntTy {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Copy, Debug)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Copy)]
 #[derive(Encodable, Decodable, HashStable_Generic)]
 pub enum UintTy {
     Usize,
@@ -506,7 +530,7 @@ impl UintTy {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[derive(Encodable, Decodable, HashStable_Generic)]
 pub enum FloatTy {
     F32,
@@ -749,20 +773,6 @@ impl fmt::Debug for IntVid {
 impl fmt::Debug for FloatVid {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "?{}f", self.index)
-    }
-}
-
-impl fmt::Debug for InferTy {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        use InferTy::*;
-        match *self {
-            TyVar(ref v) => v.fmt(f),
-            IntVar(ref v) => v.fmt(f),
-            FloatVar(ref v) => v.fmt(f),
-            FreshTy(v) => write!(f, "FreshTy({v:?})"),
-            FreshIntTy(v) => write!(f, "FreshIntTy({v:?})"),
-            FreshFloatTy(v) => write!(f, "FreshFloatTy({v:?})"),
-        }
     }
 }
 

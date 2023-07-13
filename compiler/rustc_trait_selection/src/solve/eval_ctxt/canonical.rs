@@ -8,16 +8,19 @@
 /// section of the [rustc-dev-guide][c].
 ///
 /// [c]: https://rustc-dev-guide.rust-lang.org/solve/canonicalization.html
-use super::{CanonicalGoal, Certainty, EvalCtxt, Goal};
+use super::{CanonicalInput, Certainty, EvalCtxt, Goal};
 use crate::solve::canonicalize::{CanonicalizeMode, Canonicalizer};
 use crate::solve::{CanonicalResponse, QueryResult, Response};
+use rustc_data_structures::fx::FxHashSet;
 use rustc_index::IndexVec;
 use rustc_infer::infer::canonical::query_response::make_query_region_constraints;
 use rustc_infer::infer::canonical::CanonicalVarValues;
 use rustc_infer::infer::canonical::{CanonicalExt, QueryRegionConstraints};
 use rustc_middle::traits::query::NoSolution;
-use rustc_middle::traits::solve::{ExternalConstraints, ExternalConstraintsData, MaybeCause};
-use rustc_middle::ty::{self, BoundVar, GenericArgKind};
+use rustc_middle::traits::solve::{
+    ExternalConstraints, ExternalConstraintsData, MaybeCause, PredefinedOpaquesData, QueryInput,
+};
+use rustc_middle::ty::{self, BoundVar, GenericArgKind, Ty, TyCtxt, TypeFoldable};
 use rustc_span::DUMMY_SP;
 use std::iter;
 use std::ops::Deref;
@@ -25,16 +28,24 @@ use std::ops::Deref;
 impl<'tcx> EvalCtxt<'_, 'tcx> {
     /// Canonicalizes the goal remembering the original values
     /// for each bound variable.
-    pub(super) fn canonicalize_goal(
+    pub(super) fn canonicalize_goal<T: TypeFoldable<TyCtxt<'tcx>>>(
         &self,
-        goal: Goal<'tcx, ty::Predicate<'tcx>>,
-    ) -> (Vec<ty::GenericArg<'tcx>>, CanonicalGoal<'tcx>) {
+        goal: Goal<'tcx, T>,
+    ) -> (Vec<ty::GenericArg<'tcx>>, CanonicalInput<'tcx, T>) {
         let mut orig_values = Default::default();
         let canonical_goal = Canonicalizer::canonicalize(
             self.infcx,
             CanonicalizeMode::Input,
             &mut orig_values,
-            goal,
+            QueryInput {
+                goal,
+                anchor: self.infcx.defining_use_anchor,
+                predefined_opaques_in_body: self.tcx().mk_predefined_opaques_in_body(
+                    PredefinedOpaquesData {
+                        opaque_types: self.infcx.clone_opaque_types_for_query_response(),
+                    },
+                ),
+            },
         );
         (orig_values, canonical_goal)
     }
@@ -126,10 +137,17 @@ impl<'tcx> EvalCtxt<'_, 'tcx> {
 
     #[instrument(level = "debug", skip(self), ret)]
     fn compute_external_query_constraints(&self) -> Result<ExternalConstraints<'tcx>, NoSolution> {
+        // We only check for leaks from universes which were entered inside
+        // of the query.
+        self.infcx.leak_check(self.max_input_universe, None).map_err(|e| {
+            debug!(?e, "failed the leak check");
+            NoSolution
+        })?;
+
         // Cannot use `take_registered_region_obligations` as we may compute the response
         // inside of a `probe` whenever we have multiple choices inside of the solver.
         let region_obligations = self.infcx.inner.borrow().region_obligations().to_owned();
-        let region_constraints = self.infcx.with_region_constraints(|region_constraints| {
+        let mut region_constraints = self.infcx.with_region_constraints(|region_constraints| {
             make_query_region_constraints(
                 self.tcx(),
                 region_obligations
@@ -138,7 +156,16 @@ impl<'tcx> EvalCtxt<'_, 'tcx> {
                 region_constraints,
             )
         });
-        let opaque_types = self.infcx.clone_opaque_types_for_query_response();
+
+        let mut seen = FxHashSet::default();
+        region_constraints.outlives.retain(|outlives| seen.insert(*outlives));
+
+        let mut opaque_types = self.infcx.clone_opaque_types_for_query_response();
+        // Only return opaque type keys for newly-defined opaques
+        opaque_types.retain(|(a, _)| {
+            self.predefined_opaques_in_body.opaque_types.iter().all(|(pa, _)| pa != a)
+        });
+
         Ok(self
             .tcx()
             .mk_external_constraints(ExternalConstraintsData { region_constraints, opaque_types }))
@@ -164,10 +191,10 @@ impl<'tcx> EvalCtxt<'_, 'tcx> {
 
         let nested_goals = self.unify_query_var_values(param_env, &original_values, var_values)?;
 
-        // FIXME: implement external constraints.
-        let ExternalConstraintsData { region_constraints, opaque_types: _ } =
+        let ExternalConstraintsData { region_constraints, opaque_types } =
             external_constraints.deref();
         self.register_region_constraints(region_constraints);
+        self.register_opaque_types(param_env, opaque_types)?;
 
         Ok((certainty, nested_goals))
     }
@@ -286,5 +313,16 @@ impl<'tcx> EvalCtxt<'_, 'tcx> {
             // FIXME: Deal with member constraints :<
             let _ = member_constraint;
         }
+    }
+
+    fn register_opaque_types(
+        &mut self,
+        param_env: ty::ParamEnv<'tcx>,
+        opaque_types: &[(ty::OpaqueTypeKey<'tcx>, Ty<'tcx>)],
+    ) -> Result<(), NoSolution> {
+        for &(key, ty) in opaque_types {
+            self.insert_hidden_type(key, param_env, ty)?;
+        }
+        Ok(())
     }
 }

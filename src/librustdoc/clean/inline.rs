@@ -158,13 +158,13 @@ pub(crate) fn try_inline_glob(
                 .filter_map(|child| child.res.opt_def_id())
                 .collect();
             let mut items = build_module_items(cx, did, visited, inlined_names, Some(&reexports));
-            items.drain_filter(|item| {
+            items.retain(|item| {
                 if let Some(name) = item.name {
                     // If an item with the same type and name already exists,
                     // it takes priority over the inlined stuff.
-                    !inlined_names.insert((item.type_(), name))
+                    inlined_names.insert((item.type_(), name))
                 } else {
-                    false
+                    true
                 }
             });
             Some(items)
@@ -278,8 +278,12 @@ fn build_union(cx: &mut DocContext<'_>, did: DefId) -> clean::Union {
 
 fn build_type_alias(cx: &mut DocContext<'_>, did: DefId) -> Box<clean::Typedef> {
     let predicates = cx.tcx.explicit_predicates_of(did);
-    let type_ =
-        clean_middle_ty(ty::Binder::dummy(cx.tcx.type_of(did).subst_identity()), cx, Some(did));
+    let type_ = clean_middle_ty(
+        ty::Binder::dummy(cx.tcx.type_of(did).subst_identity()),
+        cx,
+        Some(did),
+        None,
+    );
 
     Box::new(clean::Typedef {
         type_,
@@ -355,9 +359,9 @@ pub(crate) fn build_impl(
         return;
     }
 
-    let _prof_timer = cx.tcx.sess.prof.generic_activity("build_impl");
-
     let tcx = cx.tcx;
+    let _prof_timer = tcx.sess.prof.generic_activity("build_impl");
+
     let associated_trait = tcx.impl_trait_ref(did).map(ty::EarlyBinder::skip_binder);
 
     // Only inline impl if the implemented trait is
@@ -386,9 +390,12 @@ pub(crate) fn build_impl(
 
     let for_ = match &impl_item {
         Some(impl_) => clean_ty(impl_.self_ty, cx),
-        None => {
-            clean_middle_ty(ty::Binder::dummy(tcx.type_of(did).subst_identity()), cx, Some(did))
-        }
+        None => clean_middle_ty(
+            ty::Binder::dummy(tcx.type_of(did).subst_identity()),
+            cx,
+            Some(did),
+            None,
+        ),
     };
 
     // Only inline impl if the implementing type is
@@ -630,6 +637,7 @@ fn build_const(cx: &mut DocContext<'_>, def_id: DefId) -> clean::Constant {
             ty::Binder::dummy(cx.tcx.type_of(def_id).subst_identity()),
             cx,
             Some(def_id),
+            None,
         ),
         kind: clean::ConstantKind::Extern { def_id },
     }
@@ -641,6 +649,7 @@ fn build_static(cx: &mut DocContext<'_>, did: DefId, mutable: bool) -> clean::St
             ty::Binder::dummy(cx.tcx.type_of(did).subst_identity()),
             cx,
             Some(did),
+            None,
         ),
         mutability: if mutable { Mutability::Mut } else { Mutability::Not },
         expr: None,

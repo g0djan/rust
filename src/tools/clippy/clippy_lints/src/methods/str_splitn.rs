@@ -289,7 +289,7 @@ fn parse_iter_usage<'tcx>(
 ) -> Option<IterUsage> {
     let (kind, span) = match iter.next() {
         Some((_, Node::Expr(e))) if e.span.ctxt() == ctxt => {
-            let ExprKind::MethodCall(name, _, [args @ ..], _) = e.kind else {
+            let ExprKind::MethodCall(name, _, args, _) = e.kind else {
                 return None;
             };
             let did = cx.typeck_results().type_dependent_def_id(e.hir_id)?;
@@ -316,7 +316,7 @@ fn parse_iter_usage<'tcx>(
                     };
                 },
                 ("nth" | "skip", [idx_expr]) if cx.tcx.trait_of_item(did) == Some(iter_id) => {
-                    if let Some((Constant::Int(idx), _)) = constant(cx, cx.typeck_results(), idx_expr) {
+                    if let Some(Constant::Int(idx)) = constant(cx, cx.typeck_results(), idx_expr) {
                         let span = if name.ident.as_str() == "nth" {
                             e.span
                         } else {
