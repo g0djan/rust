@@ -6,6 +6,7 @@
 //! If you wonder why there's no `early.rs`, that's because it's split into three files -
 //! `build_reduced_graph.rs`, `macros.rs` and `imports.rs`.
 
+use crate::errors::ImportsCannotReferTo;
 use crate::BindingKey;
 use crate::{path_names_to_string, rustdoc, BindingError, Finalize, LexicalScopeBinding};
 use crate::{Module, ModuleOrUniformRoot, NameBinding, ParentScope, PathResult};
@@ -17,7 +18,7 @@ use rustc_ast::*;
 use rustc_data_structures::fx::{FxHashMap, FxHashSet, FxIndexMap};
 use rustc_errors::{Applicability, DiagnosticArgValue, DiagnosticId, IntoDiagnosticArg};
 use rustc_hir::def::Namespace::{self, *};
-use rustc_hir::def::{self, CtorKind, DefKind, LifetimeRes, PartialRes, PerNS};
+use rustc_hir::def::{self, CtorKind, DefKind, LifetimeRes, NonMacroAttrKind, PartialRes, PerNS};
 use rustc_hir::def_id::{DefId, LocalDefId, CRATE_DEF_ID, LOCAL_CRATE};
 use rustc_hir::{BindingAnnotation, PrimTy, TraitCandidate};
 use rustc_middle::middle::resolve_bound_vars::Set1;
@@ -1283,7 +1284,7 @@ impl<'a: 'ast, 'b, 'ast, 'tcx> LateResolutionVisitor<'a, 'b, 'ast, 'tcx> {
         ident: Ident,
         ns: Namespace,
         finalize: Option<Finalize>,
-        ignore_binding: Option<&'a NameBinding<'a>>,
+        ignore_binding: Option<NameBinding<'a>>,
     ) -> Option<LexicalScopeBinding<'a>> {
         self.r.resolve_ident_in_lexical_scope(
             ident,
@@ -1631,9 +1632,13 @@ impl<'a: 'ast, 'b, 'ast, 'tcx> LateResolutionVisitor<'a, 'b, 'ast, 'tcx> {
                                 ..
                             } = &rib.kind
                             {
-                                diag.span_help(
-                                    *span,
-                                    "consider introducing a higher-ranked lifetime here with `for<'a>`",
+                                diag.multipart_suggestion(
+                                    "consider introducing a higher-ranked lifetime here",
+                                    vec![
+                                        (span.shrink_to_lo(), "for<'a> ".into()),
+                                        (lifetime.ident.span.shrink_to_hi(), "'a ".into()),
+                                    ],
+                                    Applicability::MachineApplicable,
                                 );
                                 break;
                             }
@@ -2244,12 +2249,13 @@ impl<'a: 'ast, 'b, 'ast, 'tcx> LateResolutionVisitor<'a, 'b, 'ast, 'tcx> {
                 _ => &[TypeNS],
             };
             let report_error = |this: &Self, ns| {
-                let what = if ns == TypeNS { "type parameters" } else { "local variables" };
                 if this.should_report_errs() {
+                    let what = if ns == TypeNS { "type parameters" } else { "local variables" };
                     this.r
                         .tcx
                         .sess
-                        .span_err(ident.span, format!("imports cannot refer to {}", what));
+                        .create_err(ImportsCannotReferTo { span: ident.span, what })
+                        .emit();
                 }
             };
 
@@ -2966,7 +2972,7 @@ impl<'a: 'ast, 'b, 'ast, 'tcx> LateResolutionVisitor<'a, 'b, 'ast, 'tcx> {
         F: FnOnce(Ident, String, Option<Symbol>) -> ResolutionError<'a>,
     {
         // If there is a TraitRef in scope for an impl, then the method must be in the trait.
-        let Some((module, _)) = &self.current_trait_ref else { return; };
+        let Some((module, _)) = self.current_trait_ref else { return; };
         ident.span.normalize_to_macros_2_0_and_adjust(module.expansion);
         let key = BindingKey::new(ident, ns);
         let mut binding = self.r.resolution(module, key).try_borrow().ok().and_then(|r| r.binding);
@@ -3497,7 +3503,7 @@ impl<'a: 'ast, 'b, 'ast, 'tcx> LateResolutionVisitor<'a, 'b, 'ast, 'tcx> {
         let report_errors = |this: &mut Self, res: Option<Res>| {
             if this.should_report_errs() {
                 let (err, candidates) =
-                    this.smart_resolve_report_errors(path, path_span, source, res);
+                    this.smart_resolve_report_errors(path, None, path_span, source, res);
 
                 let def_id = this.parent_scope.module.nearest_parent_mod();
                 let instead = res.is_some();
@@ -3524,7 +3530,7 @@ impl<'a: 'ast, 'b, 'ast, 'tcx> LateResolutionVisitor<'a, 'b, 'ast, 'tcx> {
                     None
                 };
 
-                this.r.use_injections.push(UseError {
+                let ue = UseError {
                     err,
                     candidates,
                     def_id,
@@ -3532,7 +3538,9 @@ impl<'a: 'ast, 'b, 'ast, 'tcx> LateResolutionVisitor<'a, 'b, 'ast, 'tcx> {
                     suggestion,
                     path: path.into(),
                     is_call: source.is_call(),
-                });
+                };
+
+                this.r.use_injections.push(ue);
             }
 
             PartialRes::new(Res::Err)
@@ -3547,13 +3555,18 @@ impl<'a: 'ast, 'b, 'ast, 'tcx> LateResolutionVisitor<'a, 'b, 'ast, 'tcx> {
             // Before we start looking for candidates, we have to get our hands
             // on the type user is trying to perform invocation on; basically:
             // we're transforming `HashMap::new` into just `HashMap`.
-            let prefix_path = match path.split_last() {
-                Some((_, path)) if !path.is_empty() => path,
+            let (following_seg, prefix_path) = match path.split_last() {
+                Some((last, path)) if !path.is_empty() => (Some(last), path),
                 _ => return Some(parent_err),
             };
 
-            let (mut err, candidates) =
-                this.smart_resolve_report_errors(prefix_path, path_span, PathSource::Type, None);
+            let (mut err, candidates) = this.smart_resolve_report_errors(
+                prefix_path,
+                following_seg,
+                path_span,
+                PathSource::Type,
+                None,
+            );
 
             // There are two different error messages user might receive at
             // this point:
@@ -3866,8 +3879,22 @@ impl<'a: 'ast, 'b, 'ast, 'tcx> LateResolutionVisitor<'a, 'b, 'ast, 'tcx> {
             PathResult::Module(ModuleOrUniformRoot::Module(module)) => {
                 PartialRes::new(module.res().unwrap())
             }
-            PathResult::Failed { is_error_from_last_segment: false, span, label, suggestion } => {
-                return Err(respan(span, ResolutionError::FailedToResolve { label, suggestion }));
+            PathResult::Failed {
+                is_error_from_last_segment: false,
+                span,
+                label,
+                suggestion,
+                module,
+            } => {
+                return Err(respan(
+                    span,
+                    ResolutionError::FailedToResolve {
+                        last_segment: None,
+                        label,
+                        suggestion,
+                        module,
+                    },
+                ));
             }
             PathResult::Module(..) | PathResult::Failed { .. } => return Ok(None),
             PathResult::Indeterminate => bug!("indeterminate path result in resolve_qpath"),
@@ -4287,12 +4314,12 @@ impl<'a: 'ast, 'b, 'ast, 'tcx> LateResolutionVisitor<'a, 'b, 'ast, 'tcx> {
         }
     }
 
-    fn resolve_and_cache_rustdoc_path(&mut self, path_str: &str, ns: Namespace) -> bool {
+    fn resolve_and_cache_rustdoc_path(&mut self, path_str: &str, ns: Namespace) -> Option<Res> {
         // FIXME: This caching may be incorrect in case of multiple `macro_rules`
         // items with the same name in the same module.
         // Also hygiene is not considered.
         let mut doc_link_resolutions = std::mem::take(&mut self.r.doc_link_resolutions);
-        let res = doc_link_resolutions
+        let res = *doc_link_resolutions
             .entry(self.parent_scope.module.nearest_parent_mod().expect_local())
             .or_default()
             .entry((Symbol::intern(path_str), ns))
@@ -4307,8 +4334,7 @@ impl<'a: 'ast, 'b, 'ast, 'tcx> LateResolutionVisitor<'a, 'b, 'ast, 'tcx> {
                     return None;
                 }
                 res
-            })
-            .is_some();
+            });
         self.r.doc_link_resolutions = doc_link_resolutions;
         res
     }
@@ -4343,8 +4369,10 @@ impl<'a: 'ast, 'b, 'ast, 'tcx> LateResolutionVisitor<'a, 'b, 'ast, 'tcx> {
             let mut any_resolved = false;
             let mut need_assoc = false;
             for ns in [TypeNS, ValueNS, MacroNS] {
-                if self.resolve_and_cache_rustdoc_path(&path_str, ns) {
-                    any_resolved = true;
+                if let Some(res) = self.resolve_and_cache_rustdoc_path(&path_str, ns) {
+                    // Rustdoc ignores tool attribute resolutions and attempts
+                    // to resolve their prefixes for diagnostics.
+                    any_resolved = !matches!(res, Res::NonMacroAttr(NonMacroAttrKind::Tool));
                 } else if ns != MacroNS {
                     need_assoc = true;
                 }

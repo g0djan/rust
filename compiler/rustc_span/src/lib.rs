@@ -65,11 +65,11 @@ use rustc_data_structures::sync::{Lock, Lrc};
 
 use std::borrow::Cow;
 use std::cmp::{self, Ordering};
-use std::fmt;
 use std::hash::Hash;
 use std::ops::{Add, Range, Sub};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::{fmt, iter};
 
 use md5::Digest;
 use md5::Md5;
@@ -594,12 +594,6 @@ impl Span {
         matches!(outer_expn.kind, ExpnKind::Macro(..)) && outer_expn.collapse_debuginfo
     }
 
-    /// Returns `true` if this span comes from MIR inlining.
-    pub fn is_inlined(self) -> bool {
-        let outer_expn = self.ctxt().outer_expn_data();
-        matches!(outer_expn.kind, ExpnKind::Inlined)
-    }
-
     /// Returns `true` if `span` originates in a derive-macro's expansion.
     pub fn in_derive_expansion(self) -> bool {
         matches!(self.ctxt().outer_expn_data().kind, ExpnKind::Macro(MacroKind::Derive, _))
@@ -739,12 +733,15 @@ impl Span {
     /// else returns the `ExpnData` for the macro definition
     /// corresponding to the source callsite.
     pub fn source_callee(self) -> Option<ExpnData> {
-        fn source_callee(expn_data: ExpnData) -> ExpnData {
-            let next_expn_data = expn_data.call_site.ctxt().outer_expn_data();
-            if !next_expn_data.is_root() { source_callee(next_expn_data) } else { expn_data }
-        }
         let expn_data = self.ctxt().outer_expn_data();
-        if !expn_data.is_root() { Some(source_callee(expn_data)) } else { None }
+
+        // Create an iterator of call site expansions
+        iter::successors(Some(expn_data), |expn_data| {
+            Some(expn_data.call_site.ctxt().outer_expn_data())
+        })
+        // Find the last expansion which is not root
+        .take_while(|expn_data| !expn_data.is_root())
+        .last()
     }
 
     /// Checks if a span is "internal" to a macro in which `#[unstable]`
@@ -754,7 +751,7 @@ impl Span {
         self.ctxt()
             .outer_expn_data()
             .allow_internal_unstable
-            .map_or(false, |features| features.iter().any(|&f| f == feature))
+            .is_some_and(|features| features.iter().any(|&f| f == feature))
     }
 
     /// Checks if this span arises from a compiler desugaring of kind `kind`.
@@ -783,7 +780,7 @@ impl Span {
 
     pub fn macro_backtrace(mut self) -> impl Iterator<Item = ExpnData> {
         let mut prev_span = DUMMY_SP;
-        std::iter::from_fn(move || {
+        iter::from_fn(move || {
             loop {
                 let expn_data = self.ctxt().outer_expn_data();
                 if expn_data.is_root() {
@@ -832,9 +829,9 @@ impl Span {
         // Return the macro span on its own to avoid weird diagnostic output. It is preferable to
         // have an incomplete span than a completely nonsensical one.
         if span_data.ctxt != end_data.ctxt {
-            if span_data.ctxt == SyntaxContext::root() {
+            if span_data.ctxt.is_root() {
                 return end;
-            } else if end_data.ctxt == SyntaxContext::root() {
+            } else if end_data.ctxt.is_root() {
                 return self;
             }
             // Both spans fall within a macro.
@@ -843,7 +840,7 @@ impl Span {
         Span::new(
             cmp::min(span_data.lo, end_data.lo),
             cmp::max(span_data.hi, end_data.hi),
-            if span_data.ctxt == SyntaxContext::root() { end_data.ctxt } else { span_data.ctxt },
+            if span_data.ctxt.is_root() { end_data.ctxt } else { span_data.ctxt },
             if span_data.parent == end_data.parent { span_data.parent } else { None },
         )
     }
@@ -861,7 +858,7 @@ impl Span {
         Span::new(
             span.hi,
             end.lo,
-            if end.ctxt == SyntaxContext::root() { end.ctxt } else { span.ctxt },
+            if end.ctxt.is_root() { end.ctxt } else { span.ctxt },
             if span.parent == end.parent { span.parent } else { None },
         )
     }
@@ -885,9 +882,9 @@ impl Span {
         // Return the macro span on its own to avoid weird diagnostic output. It is preferable to
         // have an incomplete span than a completely nonsensical one.
         if span_data.ctxt != end_data.ctxt {
-            if span_data.ctxt == SyntaxContext::root() {
+            if span_data.ctxt.is_root() {
                 return end;
-            } else if end_data.ctxt == SyntaxContext::root() {
+            } else if end_data.ctxt.is_root() {
                 return self;
             }
             // Both spans fall within a macro.
@@ -896,7 +893,7 @@ impl Span {
         Span::new(
             span_data.lo,
             end_data.lo,
-            if end_data.ctxt == SyntaxContext::root() { end_data.ctxt } else { span_data.ctxt },
+            if end_data.ctxt.is_root() { end_data.ctxt } else { span_data.ctxt },
             if span_data.parent == end_data.parent { span_data.parent } else { None },
         )
     }
@@ -1254,29 +1251,6 @@ impl SourceFileHash {
             SourceFileHashAlgorithm::Sha1 => 20,
             SourceFileHashAlgorithm::Sha256 => 32,
         }
-    }
-}
-
-#[derive(HashStable_Generic)]
-#[derive(Copy, PartialEq, PartialOrd, Clone, Ord, Eq, Hash, Debug, Encodable, Decodable)]
-pub enum DebuggerVisualizerType {
-    Natvis,
-    GdbPrettyPrinter,
-}
-
-/// A single debugger visualizer file.
-#[derive(HashStable_Generic)]
-#[derive(Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord, Encodable, Decodable)]
-pub struct DebuggerVisualizerFile {
-    /// The complete debugger visualizer source.
-    pub src: Lrc<[u8]>,
-    /// Indicates which visualizer type this targets.
-    pub visualizer_type: DebuggerVisualizerType,
-}
-
-impl DebuggerVisualizerFile {
-    pub fn new(src: Lrc<[u8]>, visualizer_type: DebuggerVisualizerType) -> Self {
-        DebuggerVisualizerFile { src, visualizer_type }
     }
 }
 

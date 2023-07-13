@@ -20,6 +20,7 @@ allow-unauthenticated = [
     "regression-*",
     "perf-*",
     "AsyncAwait-OnDeck",
+    "needs-triage",
 ]
 
 [glacier]
@@ -190,6 +191,7 @@ trigger_files = [
     "src/stage0.json",
     "src/tools/compiletest",
     "src/tools/tidy",
+    "src/tools/rustdoc-gui-test",
 ]
 
 [autolabel."T-infra"]
@@ -252,6 +254,12 @@ trigger_files = [
 
 [autolabel."S-waiting-on-review"]
 new_pr = true
+
+[autolabel."needs-triage"]
+new_issue = true
+exclude_labels = [
+    "C-tracking-issue"
+]
 
 [autolabel."WG-trait-system-refactor"]
 trigger_files = [
@@ -371,6 +379,14 @@ cc = ["@GuillaumeGomez"]
 message = "Some changes might have occurred in exhaustiveness checking"
 cc = ["@Nadrieril"]
 
+[mentions."library/portable-simd"]
+message = """
+Portable SIMD is developed in its own repository. If possible, consider \
+making this change to [rust-lang/portable-simd](https://github.com/rust-lang/portable-simd) \
+instead.
+"""
+cc = ["@calebzulawski", "@programmerjake"]
+
 [mentions."src/librustdoc/clean/types.rs"]
 cc = ["@camelid"]
 
@@ -384,6 +400,10 @@ cc = [
 
 [mentions."src/librustdoc/html/static/css/themes"]
 message = "Some changes occurred in HTML/CSS themes."
+cc = ["@GuillaumeGomez"]
+
+[mentions."tests/rustdoc-gui/"]
+message = "Some changes occurred in GUI tests."
 cc = ["@GuillaumeGomez"]
 
 [mentions."src/librustdoc/html/static/css/themes/ayu.css"]
@@ -464,6 +484,9 @@ message = "This PR changes src/bootstrap/defaults/config.compiler.toml. If appro
 [mentions."src/bootstrap/defaults/config.codegen.toml"]
 message = "This PR changes src/bootstrap/defaults/config.codegen.toml. If appropriate, please also update `config.compiler.toml` so the defaults are in sync."
 
+[mentions."src/bootstrap/llvm.rs"]
+message = "This PR changes how LLVM is built. Consider updating src/bootstrap/download-ci-llvm-stamp."
+
 [mentions."tests/ui/deriving/deriving-all-codegen.stdout"]
 message = "Changes to the code generated for builtin derived traits."
 cc = ["@nnethercote"]
@@ -482,7 +505,6 @@ compiler-team = [
     "@petrochenkov",
     "@davidtwco",
     "@oli-obk",
-    "@lcnr",
     "@wesleywiser",
 ]
 compiler-team-contributors = [
@@ -492,6 +514,7 @@ compiler-team-contributors = [
     "@TaKO8Ki",
     "@WaffleLapkin",
     "@b-naber",
+    "@fee1-dead",
 ]
 compiler = [
     "compiler-team",
@@ -561,6 +584,7 @@ types = [
     "@lcnr",
     "@oli-obk",
     "@spastorino",
+    "@BoxyUwU",
 ]
 borrowck = [
     "@davidtwco",
@@ -593,6 +617,7 @@ style-team = [
 "/compiler/rustc_llvm" =                     ["@cuviper"]
 "/compiler/rustc_middle/src/mir" =           ["compiler", "mir"]
 "/compiler/rustc_middle/src/traits" =        ["compiler", "types"]
+"/compiler/rustc_middle/src/ty" =            ["compiler", "types"]
 "/compiler/rustc_const_eval/src/interpret" = ["compiler", "mir"]
 "/compiler/rustc_const_eval/src/transform" = ["compiler", "mir-opt"]
 "/compiler/rustc_mir_build/src/build" =      ["compiler", "mir"]
@@ -640,3 +665,4 @@ style-team = [
 "/src/tools/rustdoc-themes" =                ["rustdoc"]
 "/src/tools/tidy" =                          ["bootstrap"]
 "/src/tools/x" =                             ["bootstrap"]
+"/src/tools/rustdoc-gui-test" =              ["bootstrap", "@ozkanonur"]

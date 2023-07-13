@@ -7,6 +7,7 @@ use std::fmt;
 use std::path::Path;
 use std::process;
 
+use either::Either;
 use rand::rngs::StdRng;
 use rand::SeedableRng;
 
@@ -112,6 +113,8 @@ pub enum MiriMemoryKind {
     /// Memory for thread-local statics.
     /// This memory may leak.
     Tls,
+    /// Memory mapped directly by the program
+    Mmap,
 }
 
 impl From<MiriMemoryKind> for MemoryKind<MiriMemoryKind> {
@@ -127,7 +130,7 @@ impl MayLeak for MiriMemoryKind {
         use self::MiriMemoryKind::*;
         match self {
             Rust | Miri | C | WinHeap | Runtime => false,
-            Machine | Global | ExternStatic | Tls => true,
+            Machine | Global | ExternStatic | Tls | Mmap => true,
         }
     }
 }
@@ -145,6 +148,7 @@ impl fmt::Display for MiriMemoryKind {
             Global => write!(f, "global (static or const)"),
             ExternStatic => write!(f, "extern static"),
             Tls => write!(f, "thread-local static"),
+            Mmap => write!(f, "mmap"),
         }
     }
 }
@@ -308,12 +312,14 @@ pub struct PrimitiveLayouts<'tcx> {
 }
 
 impl<'mir, 'tcx: 'mir> PrimitiveLayouts<'tcx> {
-    fn new(layout_cx: LayoutCx<'tcx, TyCtxt<'tcx>>) -> Result<Self, LayoutError<'tcx>> {
+    fn new(layout_cx: LayoutCx<'tcx, TyCtxt<'tcx>>) -> Result<Self, &'tcx LayoutError<'tcx>> {
         let tcx = layout_cx.tcx;
-        let mut_raw_ptr = tcx.mk_ptr(TypeAndMut { ty: tcx.types.unit, mutbl: Mutability::Mut });
-        let const_raw_ptr = tcx.mk_ptr(TypeAndMut { ty: tcx.types.unit, mutbl: Mutability::Not });
+        let mut_raw_ptr =
+            Ty::new_ptr(tcx, TypeAndMut { ty: tcx.types.unit, mutbl: Mutability::Mut });
+        let const_raw_ptr =
+            Ty::new_ptr(tcx, TypeAndMut { ty: tcx.types.unit, mutbl: Mutability::Not });
         Ok(Self {
-            unit: layout_cx.layout_of(tcx.mk_unit())?,
+            unit: layout_cx.layout_of(Ty::new_unit(tcx))?,
             i8: layout_cx.layout_of(tcx.types.i8)?,
             i16: layout_cx.layout_of(tcx.types.i16)?,
             i32: layout_cx.layout_of(tcx.types.i32)?,
@@ -528,7 +534,7 @@ impl<'mir, 'tcx> MiriMachine<'mir, 'tcx> {
             let target = &tcx.sess.target;
             match target.arch.as_ref() {
                 "wasm32" | "wasm64" => 64 * 1024, // https://webassembly.github.io/spec/core/exec/runtime.html#memory-instances
-                "aarch64" =>
+                "aarch64" => {
                     if target.options.vendor.as_ref() == "apple" {
                         // No "definitive" source, but see:
                         // https://www.wwdcnotes.com/notes/wwdc20/10214/
@@ -536,7 +542,8 @@ impl<'mir, 'tcx> MiriMachine<'mir, 'tcx> {
                         16 * 1024
                     } else {
                         4 * 1024
-                    },
+                    }
+                }
                 _ => 4 * 1024,
             }
         };
@@ -651,6 +658,10 @@ impl<'mir, 'tcx> MiriMachine<'mir, 'tcx> {
 
     /// Sets up the "extern statics" for this machine.
     fn init_extern_statics(this: &mut MiriInterpCx<'mir, 'tcx>) -> InterpResult<'tcx> {
+        // "__rust_no_alloc_shim_is_unstable"
+        let val = ImmTy::from_int(0, this.machine.layouts.u8);
+        Self::alloc_extern_static(this, "__rust_no_alloc_shim_is_unstable", val)?;
+
         match this.tcx.sess.target.os.as_ref() {
             "linux" => {
                 // "environ"
@@ -712,6 +723,24 @@ impl<'mir, 'tcx> MiriMachine<'mir, 'tcx> {
     pub(crate) fn is_local(&self, frame: &FrameInfo<'_>) -> bool {
         let def_id = frame.instance.def_id();
         def_id.is_local() || self.local_crates.contains(&def_id.krate)
+    }
+
+    /// Called when the interpreter is going to shut down abnormally, such as due to a Ctrl-C.
+    pub(crate) fn handle_abnormal_termination(&mut self) {
+        // All strings in the profile data are stored in a single string table which is not
+        // written to disk until the profiler is dropped. If the interpreter exits without dropping
+        // the profiler, it is not possible to interpret the profile data and all measureme tools
+        // will panic when given the file.
+        drop(self.profiler.take());
+    }
+
+    pub(crate) fn round_up_to_multiple_of_page_size(&self, length: u64) -> Option<u64> {
+        #[allow(clippy::arithmetic_side_effects)] // page size is nonzero
+        (length.checked_add(self.page_size - 1)? / self.page_size).checked_mul(self.page_size)
+    }
+
+    pub(crate) fn page_align(&self) -> Align {
+        Align::from_bytes(self.page_size).unwrap()
     }
 }
 
@@ -865,7 +894,7 @@ impl<'mir, 'tcx> Machine<'mir, 'tcx> for MiriMachine<'mir, 'tcx> {
         ecx: &mut MiriInterpCx<'mir, 'tcx>,
         instance: ty::Instance<'tcx>,
         abi: Abi,
-        args: &[OpTy<'tcx, Provenance>],
+        args: &[FnArg<'tcx, Provenance>],
         dest: &PlaceTy<'tcx, Provenance>,
         ret: Option<mir::BasicBlock>,
         unwind: mir::UnwindAction,
@@ -878,12 +907,13 @@ impl<'mir, 'tcx> Machine<'mir, 'tcx> for MiriMachine<'mir, 'tcx> {
         ecx: &mut MiriInterpCx<'mir, 'tcx>,
         fn_val: Dlsym,
         abi: Abi,
-        args: &[OpTy<'tcx, Provenance>],
+        args: &[FnArg<'tcx, Provenance>],
         dest: &PlaceTy<'tcx, Provenance>,
         ret: Option<mir::BasicBlock>,
         _unwind: mir::UnwindAction,
     ) -> InterpResult<'tcx> {
-        ecx.call_dlsym(fn_val, abi, args, dest, ret)
+        let args = ecx.copy_fn_args(args)?; // FIXME: Should `InPlace` arguments be reset to uninit?
+        ecx.call_dlsym(fn_val, abi, &args, dest, ret)
     }
 
     #[inline(always)]
@@ -1067,8 +1097,9 @@ impl<'mir, 'tcx> Machine<'mir, 'tcx> for MiriMachine<'mir, 'tcx> {
         ptr: Pointer<Self::Provenance>,
     ) -> InterpResult<'tcx> {
         match ptr.provenance {
-            Provenance::Concrete { alloc_id, tag } =>
-                intptrcast::GlobalStateInner::expose_ptr(ecx, alloc_id, tag),
+            Provenance::Concrete { alloc_id, tag } => {
+                intptrcast::GlobalStateInner::expose_ptr(ecx, alloc_id, tag)
+            }
             Provenance::Wildcard => {
                 // No need to do anything for wildcard pointers as
                 // their provenances have already been previously exposed.
@@ -1179,6 +1210,25 @@ impl<'mir, 'tcx> Machine<'mir, 'tcx> for MiriMachine<'mir, 'tcx> {
         Ok(())
     }
 
+    fn protect_in_place_function_argument(
+        ecx: &mut InterpCx<'mir, 'tcx, Self>,
+        place: &PlaceTy<'tcx, Provenance>,
+    ) -> InterpResult<'tcx> {
+        // We do need to write `uninit` so that even after the call ends, the former contents of
+        // this place cannot be observed any more.
+        ecx.write_uninit(place)?;
+        // If we have a borrow tracker, we also have it set up protection so that all reads *and
+        // writes* during this call are insta-UB.
+        if ecx.machine.borrow_tracker.is_some() {
+            if let Either::Left(place) = place.as_mplace_or_local() {
+                ecx.protect_place(&place)?;
+            } else {
+                // Locals that don't have their address taken are as protected as they can ever be.
+            }
+        }
+        Ok(())
+    }
+
     #[inline(always)]
     fn init_frame_extra(
         ecx: &mut InterpCx<'mir, 'tcx, Self>,
@@ -1261,8 +1311,17 @@ impl<'mir, 'tcx> Machine<'mir, 'tcx> for MiriMachine<'mir, 'tcx> {
             let stack_len = ecx.active_thread_stack().len();
             ecx.active_thread_mut().set_top_user_relevant_frame(stack_len - 1);
         }
-        if ecx.machine.borrow_tracker.is_some() {
-            ecx.retag_return_place()?;
+        Ok(())
+    }
+
+    fn before_stack_pop(
+        ecx: &InterpCx<'mir, 'tcx, Self>,
+        frame: &Frame<'mir, 'tcx, Self::Provenance, Self::FrameExtra>,
+    ) -> InterpResult<'tcx> {
+        // We want this *before* the return value copy, because the return place itself is protected
+        // until we do `end_call` here.
+        if let Some(borrow_tracker) = &ecx.machine.borrow_tracker {
+            borrow_tracker.borrow_mut().end_call(&frame.extra);
         }
         Ok(())
     }
@@ -1281,9 +1340,6 @@ impl<'mir, 'tcx> Machine<'mir, 'tcx> for MiriMachine<'mir, 'tcx> {
             ecx.active_thread_mut().recompute_top_user_relevant_frame();
         }
         let timing = frame.extra.timing.take();
-        if let Some(borrow_tracker) = &ecx.machine.borrow_tracker {
-            borrow_tracker.borrow_mut().end_call(&frame.extra);
-        }
         let res = ecx.handle_stack_pop_unwind(frame.extra, unwinding);
         if let Some(profiler) = ecx.machine.profiler.as_ref() {
             profiler.finish_recording_interval_event(timing.unwrap());

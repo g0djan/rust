@@ -483,7 +483,11 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
 
                 // `index` is an array, not a SIMD type
                 let ty::Array(_, index_len) = index.layout.ty.kind() else {
-                    span_bug!(this.cur_span(), "simd_shuffle index argument has non-array type {}", index.layout.ty)
+                    span_bug!(
+                        this.cur_span(),
+                        "simd_shuffle index argument has non-array type {}",
+                        index.layout.ty
+                    )
                 };
                 let index_len = index_len.eval_target_usize(*this.tcx, this.param_env());
 
@@ -563,7 +567,11 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                 let (op, op_len) = this.operand_to_simd(op)?;
                 let bitmask_len = op_len.max(8);
 
-                assert!(dest.layout.ty.is_integral());
+                // Returns either an unsigned integer or array of `u8`.
+                assert!(
+                    dest.layout.ty.is_integral()
+                        || matches!(dest.layout.ty.kind(), ty::Array(elemty, _) if elemty == &this.tcx.types.u8)
+                );
                 assert!(bitmask_len <= 64);
                 assert_eq!(bitmask_len, dest.layout.size.bits());
                 let op_len = u32::try_from(op_len).unwrap();
@@ -577,7 +585,10 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                             .unwrap();
                     }
                 }
-                this.write_int(res, dest)?;
+                // We have to force the place type to be an int so that we can write `res` into it.
+                let mut dest = this.force_allocation(dest)?;
+                dest.layout = this.machine.layouts.uint(dest.layout.size).unwrap();
+                this.write_int(res, &dest.into())?;
             }
 
             name => throw_unsup_format!("unimplemented intrinsic: `simd_{name}`"),
@@ -605,7 +616,7 @@ fn simd_bitmask_index(idx: u32, vec_len: u32, endianness: Endian) -> u32 {
     assert!(idx < vec_len);
     match endianness {
         Endian::Little => idx,
-        #[allow(clippy::integer_arithmetic)] // idx < vec_len
+        #[allow(clippy::arithmetic_side_effects)] // idx < vec_len
         Endian::Big => vec_len - 1 - idx, // reverse order of bits
     }
 }
@@ -615,9 +626,7 @@ fn fmax_op<'tcx>(
     right: &ImmTy<'tcx, Provenance>,
 ) -> InterpResult<'tcx, Scalar<Provenance>> {
     assert_eq!(left.layout.ty, right.layout.ty);
-    let ty::Float(float_ty) = left.layout.ty.kind() else {
-        bug!("fmax operand is not a float")
-    };
+    let ty::Float(float_ty) = left.layout.ty.kind() else { bug!("fmax operand is not a float") };
     let left = left.to_scalar();
     let right = right.to_scalar();
     Ok(match float_ty {
@@ -631,9 +640,7 @@ fn fmin_op<'tcx>(
     right: &ImmTy<'tcx, Provenance>,
 ) -> InterpResult<'tcx, Scalar<Provenance>> {
     assert_eq!(left.layout.ty, right.layout.ty);
-    let ty::Float(float_ty) = left.layout.ty.kind() else {
-        bug!("fmin operand is not a float")
-    };
+    let ty::Float(float_ty) = left.layout.ty.kind() else { bug!("fmin operand is not a float") };
     let left = left.to_scalar();
     let right = right.to_scalar();
     Ok(match float_ty {

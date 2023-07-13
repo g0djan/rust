@@ -432,6 +432,10 @@ impl<'a> IntoDiagnostic<'a> for NonExhaustivePatternsTypeNotEmpty<'_, '_, '_> {
     }
 }
 
+#[derive(Subdiagnostic)]
+#[note(mir_build_non_exhaustive_match_all_arms_guarded)]
+pub struct NonExhaustiveMatchAllArmsGuarded;
+
 #[derive(Diagnostic)]
 #[diag(mir_build_static_in_pattern, code = "E0158")]
 pub struct StaticInPattern {
@@ -781,6 +785,8 @@ pub(crate) struct PatternNotCovered<'s, 'tcx> {
     pub interpreted_as_const: Option<InterpretedAsConst>,
     #[subdiagnostic]
     pub adt_defined_here: Option<AdtDefinedHere<'tcx>>,
+    #[note(mir_build_privately_uninhabited)]
+    pub witness_1_is_privately_uninhabited: Option<()>,
     #[note(mir_build_pattern_ty)]
     pub _p: (),
     pub pattern_ty: Ty<'tcx>,

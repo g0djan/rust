@@ -308,7 +308,7 @@ impl<'a, 'tcx> PrintVisitor<'a, 'tcx> {
                 bind!(self, vec);
                 kind!("CStr(ref {vec})");
                 chain!(self, "let [{:?}] = **{vec}", vec.value);
-            }
+            },
             LitKind::Str(s, _) => {
                 bind!(self, s);
                 kind!("Str({s}, _)");
@@ -558,6 +558,11 @@ impl<'a, 'tcx> PrintVisitor<'a, 'tcx> {
                 opt_bind!(self, value);
                 kind!("Ret({value})");
                 value.if_some(|e| self.expr(e));
+            },
+            ExprKind::Become(value) => {
+                bind!(self, value);
+                kind!("Become({value})");
+                self.expr(value);
             },
             ExprKind::InlineAsm(_) => {
                 kind!("InlineAsm(_)");

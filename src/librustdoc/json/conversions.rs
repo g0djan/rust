@@ -40,7 +40,7 @@ impl JsonRenderer<'_> {
                 (String::from(&**link), id_from_item_default(id.into(), self.tcx))
             })
             .collect();
-        let docs = item.attrs.collapsed_doc_value();
+        let docs = item.opt_doc_value();
         let attrs = item.attributes(self.tcx, true);
         let span = item.span(self.tcx);
         let visibility = item.visibility(self.tcx);
@@ -624,10 +624,7 @@ impl FromWithTcx<clean::FnDecl> for FnDecl {
                 .into_iter()
                 .map(|arg| (arg.name.to_string(), arg.type_.into_tcx(tcx)))
                 .collect(),
-            output: match output {
-                clean::FnRetTy::Return(t) => Some(t.into_tcx(tcx)),
-                clean::FnRetTy::DefaultReturn => None,
-            },
+            output: if output.is_unit() { None } else { Some(output.into_tcx(tcx)) },
             c_variadic,
         }
     }

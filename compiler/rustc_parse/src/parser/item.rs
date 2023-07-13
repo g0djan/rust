@@ -699,7 +699,7 @@ impl<'a> Parser<'a> {
                         // ```
                         && self
                             .span_to_snippet(self.prev_token.span)
-                            .map_or(false, |snippet| snippet == "}")
+                            .is_ok_and(|snippet| snippet == "}")
                         && self.token.kind == token::Semi;
                     let mut semicolon_span = self.token.span;
                     if !is_unnecessary_semicolon {
@@ -2182,7 +2182,11 @@ impl<'a> Parser<'a> {
             // `extern ABI fn`
             || self.check_keyword_case(kw::Extern, case)
                 && self.look_ahead(1, |t| t.can_begin_literal_maybe_minus())
-                && self.look_ahead(2, |t| t.is_keyword_case(kw::Fn, case))
+                && (self.look_ahead(2, |t| t.is_keyword_case(kw::Fn, case)) ||
+                    // this branch is only for better diagnostic in later, `pub` is not allowed here
+                    (self.may_recover()
+                        && self.look_ahead(2, |t| t.is_keyword(kw::Pub))
+                        && self.look_ahead(3, |t| t.is_keyword_case(kw::Fn, case))))
     }
 
     /// Parses all the "front matter" (or "qualifiers") for a `fn` declaration,

@@ -306,7 +306,7 @@ impl<'tcx> GenKillAnalysis<'tcx> for MaybeInitializedPlaces<'_, 'tcx> {
     type Idx = MovePathIndex;
 
     fn statement_effect(
-        &self,
+        &mut self,
         trans: &mut impl GenKill<Self::Idx>,
         statement: &mir::Statement<'tcx>,
         location: Location,
@@ -329,7 +329,7 @@ impl<'tcx> GenKillAnalysis<'tcx> for MaybeInitializedPlaces<'_, 'tcx> {
     }
 
     fn terminator_effect(
-        &self,
+        &mut self,
         trans: &mut impl GenKill<Self::Idx>,
         terminator: &mir::Terminator<'tcx>,
         location: Location,
@@ -351,7 +351,7 @@ impl<'tcx> GenKillAnalysis<'tcx> for MaybeInitializedPlaces<'_, 'tcx> {
     }
 
     fn call_return_effect(
-        &self,
+        &mut self,
         trans: &mut impl GenKill<Self::Idx>,
         _block: mir::BasicBlock,
         return_places: CallReturnPlaces<'_, 'tcx>,
@@ -372,7 +372,7 @@ impl<'tcx> GenKillAnalysis<'tcx> for MaybeInitializedPlaces<'_, 'tcx> {
     }
 
     fn switch_int_edge_effects<G: GenKill<Self::Idx>>(
-        &self,
+        &mut self,
         block: mir::BasicBlock,
         discr: &mir::Operand<'tcx>,
         edge_effects: &mut impl SwitchIntEdgeEffects<G>,
@@ -442,7 +442,7 @@ impl<'tcx> GenKillAnalysis<'tcx> for MaybeUninitializedPlaces<'_, 'tcx> {
     type Idx = MovePathIndex;
 
     fn statement_effect(
-        &self,
+        &mut self,
         trans: &mut impl GenKill<Self::Idx>,
         _statement: &mir::Statement<'tcx>,
         location: Location,
@@ -456,7 +456,7 @@ impl<'tcx> GenKillAnalysis<'tcx> for MaybeUninitializedPlaces<'_, 'tcx> {
     }
 
     fn terminator_effect(
-        &self,
+        &mut self,
         trans: &mut impl GenKill<Self::Idx>,
         _terminator: &mir::Terminator<'tcx>,
         location: Location,
@@ -467,7 +467,7 @@ impl<'tcx> GenKillAnalysis<'tcx> for MaybeUninitializedPlaces<'_, 'tcx> {
     }
 
     fn call_return_effect(
-        &self,
+        &mut self,
         trans: &mut impl GenKill<Self::Idx>,
         _block: mir::BasicBlock,
         return_places: CallReturnPlaces<'_, 'tcx>,
@@ -488,7 +488,7 @@ impl<'tcx> GenKillAnalysis<'tcx> for MaybeUninitializedPlaces<'_, 'tcx> {
     }
 
     fn switch_int_edge_effects<G: GenKill<Self::Idx>>(
-        &self,
+        &mut self,
         block: mir::BasicBlock,
         discr: &mir::Operand<'tcx>,
         edge_effects: &mut impl SwitchIntEdgeEffects<G>,
@@ -562,7 +562,7 @@ impl<'tcx> GenKillAnalysis<'tcx> for DefinitelyInitializedPlaces<'_, 'tcx> {
     type Idx = MovePathIndex;
 
     fn statement_effect(
-        &self,
+        &mut self,
         trans: &mut impl GenKill<Self::Idx>,
         _statement: &mir::Statement<'tcx>,
         location: Location,
@@ -573,7 +573,7 @@ impl<'tcx> GenKillAnalysis<'tcx> for DefinitelyInitializedPlaces<'_, 'tcx> {
     }
 
     fn terminator_effect(
-        &self,
+        &mut self,
         trans: &mut impl GenKill<Self::Idx>,
         _terminator: &mir::Terminator<'tcx>,
         location: Location,
@@ -584,7 +584,7 @@ impl<'tcx> GenKillAnalysis<'tcx> for DefinitelyInitializedPlaces<'_, 'tcx> {
     }
 
     fn call_return_effect(
-        &self,
+        &mut self,
         trans: &mut impl GenKill<Self::Idx>,
         _block: mir::BasicBlock,
         return_places: CallReturnPlaces<'_, 'tcx>,
@@ -627,7 +627,7 @@ impl<'tcx> GenKillAnalysis<'tcx> for EverInitializedPlaces<'_, 'tcx> {
 
     #[instrument(skip(self, trans), level = "debug")]
     fn statement_effect(
-        &self,
+        &mut self,
         trans: &mut impl GenKill<Self::Idx>,
         stmt: &mir::Statement<'tcx>,
         location: Location,
@@ -651,7 +651,7 @@ impl<'tcx> GenKillAnalysis<'tcx> for EverInitializedPlaces<'_, 'tcx> {
 
     #[instrument(skip(self, trans, _terminator), level = "debug")]
     fn terminator_effect(
-        &self,
+        &mut self,
         trans: &mut impl GenKill<Self::Idx>,
         _terminator: &mir::Terminator<'tcx>,
         location: Location,
@@ -672,7 +672,7 @@ impl<'tcx> GenKillAnalysis<'tcx> for EverInitializedPlaces<'_, 'tcx> {
     }
 
     fn call_return_effect(
-        &self,
+        &mut self,
         trans: &mut impl GenKill<Self::Idx>,
         block: mir::BasicBlock,
         _return_places: CallReturnPlaces<'_, 'tcx>,
@@ -731,11 +731,11 @@ fn switch_on_enum_discriminant<'mir, 'tcx>(
 
 struct OnMutBorrow<F>(F);
 
-impl<F> Visitor<'_> for OnMutBorrow<F>
+impl<'tcx, F> Visitor<'tcx> for OnMutBorrow<F>
 where
-    F: FnMut(&mir::Place<'_>),
+    F: FnMut(&mir::Place<'tcx>),
 {
-    fn visit_rvalue(&mut self, rvalue: &mir::Rvalue<'_>, location: Location) {
+    fn visit_rvalue(&mut self, rvalue: &mir::Rvalue<'tcx>, location: Location) {
         // FIXME: Does `&raw const foo` allow mutation? See #90413.
         match rvalue {
             mir::Rvalue::Ref(_, mir::BorrowKind::Mut { .. }, place)
@@ -756,7 +756,7 @@ where
 fn for_each_mut_borrow<'tcx>(
     mir: &impl MirVisitable<'tcx>,
     location: Location,
-    f: impl FnMut(&mir::Place<'_>),
+    f: impl FnMut(&mir::Place<'tcx>),
 ) {
     let mut vis = OnMutBorrow(f);
 

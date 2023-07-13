@@ -277,9 +277,11 @@ impl<'a, 'tcx> MemCategorizationContext<'a, 'tcx> {
             adjustment::Adjust::Deref(overloaded) => {
                 // Equivalent to *expr or something similar.
                 let base = if let Some(deref) = overloaded {
-                    let ref_ty = self
-                        .tcx()
-                        .mk_ref(deref.region, ty::TypeAndMut { ty: target, mutbl: deref.mutbl });
+                    let ref_ty = Ty::new_ref(
+                        self.tcx(),
+                        deref.region,
+                        ty::TypeAndMut { ty: target, mutbl: deref.mutbl },
+                    );
                     self.cat_rvalue(expr.hir_id, expr.span, ref_ty)
                 } else {
                     previous()?
@@ -361,6 +363,7 @@ impl<'a, 'tcx> MemCategorizationContext<'a, 'tcx> {
             | hir::ExprKind::AssignOp(..)
             | hir::ExprKind::Closure { .. }
             | hir::ExprKind::Ret(..)
+            | hir::ExprKind::Become(..)
             | hir::ExprKind::Unary(..)
             | hir::ExprKind::Yield(..)
             | hir::ExprKind::MethodCall(..)
@@ -411,7 +414,7 @@ impl<'a, 'tcx> MemCategorizationContext<'a, 'tcx> {
             }
 
             Res::Local(var_id) => {
-                if self.upvars.map_or(false, |upvars| upvars.contains_key(&var_id)) {
+                if self.upvars.is_some_and(|upvars| upvars.contains_key(&var_id)) {
                     self.cat_upvar(hir_id, var_id)
                 } else {
                     Ok(PlaceWithHirId::new(hir_id, expr_ty, PlaceBase::Local(var_id), Vec::new()))
@@ -488,7 +491,7 @@ impl<'a, 'tcx> MemCategorizationContext<'a, 'tcx> {
         let ty::Ref(region, _, mutbl) = *base_ty.kind() else {
             span_bug!(expr.span, "cat_overloaded_place: base is not a reference");
         };
-        let ref_ty = self.tcx().mk_ref(region, ty::TypeAndMut { ty: place_ty, mutbl });
+        let ref_ty = Ty::new_ref(self.tcx(), region, ty::TypeAndMut { ty: place_ty, mutbl });
 
         let base = self.cat_rvalue(expr.hir_id, expr.span, ref_ty);
         self.cat_deref(expr, base)

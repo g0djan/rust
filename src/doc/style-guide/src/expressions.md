@@ -288,14 +288,16 @@ and other assignment operators such as `+=` or `*=`).
 
 For comparison operators, because for `T op U`, `&T op &U` is also implemented:
 if you have `t: &T`, and `u: U`, prefer `*t op u` to `t op &u`. In general,
-within expressions, prefer dereferencing to taking references.
+within expressions, prefer dereferencing to taking references, unless necessary
+(e.g. to avoid an unnecessarily expensive operation).
 
 Use parentheses liberally, do not necessarily elide them due to precedence.
 Tools should not automatically insert or remove parentheses. Do not use spaces
 to indicate precedence.
 
-If line-breaking, put the operator on a new line and block indent. Put each
-sub-expression on its own line. E.g.,
+If line-breaking, block-indent each subsequent line. For assignment operators,
+break after the operator; for all other operators, put the operator on the
+subsequent line. Put each sub-expression on its own line:
 
 ```rust
 foo_bar
@@ -449,12 +451,11 @@ foo(
 
 #### Multi-line elements
 
-If any element in a chain is formatted across multiple lines, then that element
-and any later elements must be on their own line. Earlier elements may be kept
-on a single line. E.g.,
+If any element in a chain is formatted across multiple lines, put that element
+and any later elements on their own lines.
 
 ```rust
-a.b.c()?.d
+a.b.c()?
     .foo(
         an_expr,
         another_expr,
@@ -690,7 +691,7 @@ Where it is possible to use a block form on the right-hand side and avoid
 breaking the left-hand side, do that. E.g.
 
 ```rust
-    // Assuming the following line does done fit in the max width
+    // Assuming the following line does not fit in the max width
     a_very_long_pattern | another_pattern => ALongStructName {
         ...
     },
@@ -751,9 +752,9 @@ not put the `if` clause on a newline. E.g.,
     }
 ```
 
-If every clause in a pattern is *small*, but does not fit on one line, then the
-pattern may be formatted across multiple lines with as many clauses per line as
-possible. Again break before a `|`:
+If every clause in a pattern is *small*, but the whole pattern does not fit on
+one line, then the pattern may be formatted across multiple lines with as many
+clauses per line as possible. Again break before a `|`:
 
 ```rust
     foo | bar | baz
@@ -762,17 +763,18 @@ possible. Again break before a `|`:
     }
 ```
 
-We define a pattern clause to be *small* if it matches the following grammar:
+We define a pattern clause to be *small* if it fits on a single line and
+matches "small" in the following grammar:
 
 ```
-[small, ntp]:
-    - single token
-    - `&[single-line, ntp]`
+small:
+    - small_no_tuple
+    - unary tuple constructor: `(` small_no_tuple `,` `)`
+    - `&` small
 
-[small]:
-    - `[small, ntp]`
-    - unary tuple constructor `([small, ntp])`
-    - `&[small]`
+small_no_tuple:
+    - single token
+    - `&` small_no_tuple
 ```
 
 E.g., `&&Some(foo)` matches, `Foo(4, Bar)` does not.
@@ -800,6 +802,16 @@ foo(|param| {
     action();
     foo(param)
 })
+
+let x = combinable([
+    an_expr,
+    another_expr,
+]);
+
+let arr = [combinable(
+    an_expr,
+    another_expr,
+)];
 ```
 
 Such behaviour should extend recursively, however, tools may choose to limit the

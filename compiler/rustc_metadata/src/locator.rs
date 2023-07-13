@@ -567,7 +567,7 @@ impl<'a> CrateLocator<'a> {
         let mut err_data: Option<Vec<PathBuf>> = None;
         for (lib, kind) in m {
             info!("{} reading metadata from: {}", flavor, lib.display());
-            if flavor == CrateFlavor::Rmeta && lib.metadata().map_or(false, |m| m.len() == 0) {
+            if flavor == CrateFlavor::Rmeta && lib.metadata().is_ok_and(|m| m.len() == 0) {
                 // Empty files will cause get_metadata_section to fail. Rmeta
                 // files can be empty, for example with binaries (which can
                 // often appear with `cargo check` when checking a library as
@@ -602,7 +602,7 @@ impl<'a> CrateLocator<'a> {
                     }
                 };
             // If we see multiple hashes, emit an error about duplicate candidates.
-            if slot.as_ref().map_or(false, |s| s.0 != hash) {
+            if slot.as_ref().is_some_and(|s| s.0 != hash) {
                 if let Some(candidates) = err_data {
                     return Err(CrateError::MultipleCandidates(
                         self.crate_name,
@@ -666,31 +666,30 @@ impl<'a> CrateLocator<'a> {
             return None;
         }
 
-        let root = metadata.get_root();
-        if root.is_proc_macro_crate() != self.is_proc_macro {
+        let header = metadata.get_header();
+        if header.is_proc_macro_crate != self.is_proc_macro {
             info!(
                 "Rejecting via proc macro: expected {} got {}",
-                self.is_proc_macro,
-                root.is_proc_macro_crate(),
+                self.is_proc_macro, header.is_proc_macro_crate,
             );
             return None;
         }
 
-        if self.exact_paths.is_empty() && self.crate_name != root.name() {
+        if self.exact_paths.is_empty() && self.crate_name != header.name {
             info!("Rejecting via crate name");
             return None;
         }
 
-        if root.triple() != &self.triple {
-            info!("Rejecting via crate triple: expected {} got {}", self.triple, root.triple());
+        if header.triple != self.triple {
+            info!("Rejecting via crate triple: expected {} got {}", self.triple, header.triple);
             self.crate_rejections.via_triple.push(CrateMismatch {
                 path: libpath.to_path_buf(),
-                got: root.triple().to_string(),
+                got: header.triple.to_string(),
             });
             return None;
         }
 
-        let hash = root.hash();
+        let hash = header.hash;
         if let Some(expected_hash) = self.hash {
             if hash != expected_hash {
                 info!("Rejecting via hash: expected {} got {}", expected_hash, hash);
@@ -961,6 +960,7 @@ pub(crate) enum CrateError {
     DlSym(String),
     LocatorCombined(Box<CombinedLocatorError>),
     NonDylibPlugin(Symbol),
+    NotFound(Symbol),
 }
 
 enum MetadataError<'a> {
@@ -1130,6 +1130,18 @@ impl CrateError {
             }
             CrateError::NonDylibPlugin(crate_name) => {
                 sess.emit_err(errors::NoDylibPlugin { span, crate_name });
+            }
+            CrateError::NotFound(crate_name) => {
+                sess.emit_err(errors::CannotFindCrate {
+                    span,
+                    crate_name,
+                    add_info: String::new(),
+                    missing_core,
+                    current_crate: sess.opts.crate_name.clone().unwrap_or("<unknown>".to_string()),
+                    is_nightly_build: sess.is_nightly_build(),
+                    profiler_runtime: Symbol::intern(&sess.opts.unstable_opts.profiler_runtime),
+                    locator_triple: sess.opts.target_triple.clone(),
+                });
             }
         }
     }

@@ -50,6 +50,7 @@ extern crate tracing;
 
 mod array_into_iter;
 pub mod builtin;
+mod cast_ref_to_mut;
 mod context;
 mod deref_into_dyn_supertrait;
 mod drop_forget_useless;
@@ -57,9 +58,11 @@ mod early;
 mod enum_intrinsics_non_enums;
 mod errors;
 mod expect;
+mod fn_null_check;
 mod for_loops_over_fallibles;
 pub mod hidden_unicode_codepoints;
 mod internal;
+mod invalid_from_utf8;
 mod late;
 mod let_underscore;
 mod levels;
@@ -96,12 +99,15 @@ use rustc_span::Span;
 
 use array_into_iter::ArrayIntoIter;
 use builtin::*;
+use cast_ref_to_mut::*;
 use deref_into_dyn_supertrait::*;
 use drop_forget_useless::*;
 use enum_intrinsics_non_enums::EnumIntrinsicsNonEnums;
+use fn_null_check::*;
 use for_loops_over_fallibles::*;
 use hidden_unicode_codepoints::*;
 use internal::*;
+use invalid_from_utf8::*;
 use let_underscore::*;
 use map_unit_fn::*;
 use methods::*;
@@ -207,10 +213,12 @@ late_lint_methods!(
             HardwiredLints: HardwiredLints,
             ImproperCTypesDeclarations: ImproperCTypesDeclarations,
             ImproperCTypesDefinitions: ImproperCTypesDefinitions,
+            InvalidFromUtf8: InvalidFromUtf8,
             VariantSizeDifferences: VariantSizeDifferences,
             BoxPointers: BoxPointers,
             PathStatements: PathStatements,
             LetUnderscore: LetUnderscore,
+            CastRefToMut: CastRefToMut,
             // Depends on referenced function signatures in expressions
             UnusedResults: UnusedResults,
             NonUpperCaseGlobals: NonUpperCaseGlobals,
@@ -219,6 +227,7 @@ late_lint_methods!(
             // Depends on types used in type definitions
             MissingCopyImplementations: MissingCopyImplementations,
             // Depends on referenced function signatures in expressions
+            IncorrectFnNullChecks: IncorrectFnNullChecks,
             MutableTransmutes: MutableTransmutes,
             TypeAliasBounds: TypeAliasBounds,
             TrivialConstraints: TrivialConstraints,

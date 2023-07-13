@@ -5,7 +5,6 @@
 #![feature(box_patterns)]
 #![feature(min_specialization)]
 #![feature(control_flow_enum)]
-#![feature(drain_filter)]
 #![feature(option_as_slice)]
 #![allow(rustc::potential_query_instability)]
 #![recursion_limit = "256"]
@@ -90,13 +89,6 @@ macro_rules! type_error_struct {
     })
 }
 
-/// The type of a local binding, including the revealed type for anon types.
-#[derive(Copy, Clone, Debug)]
-pub struct LocalTy<'tcx> {
-    decl_ty: Ty<'tcx>,
-    revealed_ty: Ty<'tcx>,
-}
-
 /// If this `DefId` is a "primary tables entry", returns
 /// `Some((body_id, body_ty, fn_sig))`. Otherwise, returns `None`.
 ///
@@ -149,7 +141,7 @@ fn has_typeck_results(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
 }
 
 fn used_trait_imports(tcx: TyCtxt<'_>, def_id: LocalDefId) -> &UnordSet<LocalDefId> {
-    &*tcx.typeck(def_id).used_trait_imports
+    &tcx.typeck(def_id).used_trait_imports
 }
 
 fn typeck<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId) -> &ty::TypeckResults<'tcx> {
@@ -162,7 +154,7 @@ fn typeck<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId) -> &ty::TypeckResults<'tc
 fn diagnostic_only_typeck<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId) -> &ty::TypeckResults<'tcx> {
     let fallback = move || {
         let span = tcx.hir().span(tcx.hir().local_def_id_to_hir_id(def_id));
-        tcx.ty_error_with_message(span, "diagnostic only typeck table used")
+        Ty::new_error_with_message(tcx, span, "diagnostic only typeck table used")
     };
     typeck_with_fallback(tcx, def_id, fallback)
 }
@@ -212,7 +204,7 @@ fn typeck_with_fallback<'tcx>(
         let fn_sig = tcx.liberate_late_bound_regions(def_id.to_def_id(), fn_sig);
         let fn_sig = fcx.normalize(body.value.span, fn_sig);
 
-        check_fn(&mut fcx, fn_sig, decl, def_id, body, None);
+        check_fn(&mut fcx, fn_sig, decl, def_id, body, None, tcx.features().unsized_fn_params);
     } else {
         let expected_type = if let Some(&hir::Ty { kind: hir::TyKind::Infer, span, .. }) = body_ty {
             Some(fcx.next_ty_var(TypeVariableOrigin {

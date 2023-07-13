@@ -1,5 +1,6 @@
 #![feature(array_chunks)]
 #![feature(box_patterns)]
+#![feature(if_let_guard)]
 #![feature(let_chains)]
 #![feature(lint_reasons)]
 #![feature(never_type)]
@@ -19,6 +20,7 @@
 extern crate rustc_ast;
 extern crate rustc_ast_pretty;
 extern crate rustc_attr;
+extern crate rustc_const_eval;
 extern crate rustc_data_structures;
 // The `rustc_driver` crate seems to be required in order to use the `rust_ast` crate.
 #[allow(unused_extern_crates)]
@@ -76,6 +78,7 @@ use std::sync::OnceLock;
 use std::sync::{Mutex, MutexGuard};
 
 use if_chain::if_chain;
+use itertools::Itertools;
 use rustc_ast::ast::{self, LitKind, RangeLimits};
 use rustc_ast::Attribute;
 use rustc_data_structures::fx::FxHashMap;
@@ -282,6 +285,15 @@ pub fn is_wild(pat: &Pat<'_>) -> bool {
     matches!(pat.kind, PatKind::Wild)
 }
 
+/// Checks if the given `QPath` belongs to a type alias.
+pub fn is_ty_alias(qpath: &QPath<'_>) -> bool {
+    match *qpath {
+        QPath::Resolved(_, path) => matches!(path.res, Res::Def(DefKind::TyAlias | DefKind::AssocTy, ..)),
+        QPath::TypeRelative(ty, _) if let TyKind::Path(qpath) = ty.kind => { is_ty_alias(&qpath) },
+        _ => false,
+    }
+}
+
 /// Checks if the method call given in `expr` belongs to the given trait.
 /// This is a deprecated function, consider using [`is_trait_method`].
 pub fn match_trait_method(cx: &LateContext<'_>, expr: &Expr<'_>, path: &[&str]) -> bool {
@@ -313,6 +325,18 @@ pub fn is_trait_method(cx: &LateContext<'_>, expr: &Expr<'_>, diag_item: Symbol)
     cx.typeck_results()
         .type_dependent_def_id(expr.hir_id)
         .map_or(false, |did| is_diag_trait_item(cx, did, diag_item))
+}
+
+/// Checks if the `def_id` belongs to a function that is part of a trait impl.
+pub fn is_def_id_trait_method(cx: &LateContext<'_>, def_id: LocalDefId) -> bool {
+    if let Some(hir_id) = cx.tcx.opt_local_def_id_to_hir_id(def_id)
+        && let Node::Item(item) = cx.tcx.hir().get_parent(hir_id)
+        && let ItemKind::Impl(imp) = item.kind
+    {
+        imp.of_trait.is_some()
+    } else {
+        false
+    }
 }
 
 /// Checks if the given expression is a path referring an item on the trait
@@ -1487,8 +1511,8 @@ pub fn is_range_full(cx: &LateContext<'_>, expr: &Expr<'_>, container_path: Opti
                 && let Some(min_val) = bnd_ty.numeric_min_val(cx.tcx)
                 && let const_val = cx.tcx.valtree_to_const_val((bnd_ty, min_val.to_valtree()))
                 && let min_const_kind = ConstantKind::from_value(const_val, bnd_ty)
-                && let Some(min_const) = miri_to_const(cx.tcx, min_const_kind)
-                && let Some((start_const, _)) = constant(cx, cx.typeck_results(), start)
+                && let Some(min_const) = miri_to_const(cx, min_const_kind)
+                && let Some(start_const) = constant(cx, cx.typeck_results(), start)
             {
                 start_const == min_const
             } else {
@@ -1503,8 +1527,8 @@ pub fn is_range_full(cx: &LateContext<'_>, expr: &Expr<'_>, container_path: Opti
                         && let Some(max_val) = bnd_ty.numeric_max_val(cx.tcx)
                         && let const_val = cx.tcx.valtree_to_const_val((bnd_ty, max_val.to_valtree()))
                         && let max_const_kind = ConstantKind::from_value(const_val, bnd_ty)
-                        && let Some(max_const) = miri_to_const(cx.tcx, max_const_kind)
-                        && let Some((end_const, _)) = constant(cx, cx.typeck_results(), end)
+                        && let Some(max_const) = miri_to_const(cx, max_const_kind)
+                        && let Some(end_const) = constant(cx, cx.typeck_results(), end)
                     {
                         end_const == max_const
                     } else {
@@ -1536,7 +1560,7 @@ pub fn is_integer_const(cx: &LateContext<'_>, e: &Expr<'_>, value: u128) -> bool
         return true;
     }
     let enclosing_body = cx.tcx.hir().enclosing_body_owner(e.hir_id);
-    if let Some((Constant::Int(v), _)) = constant(cx, cx.tcx.typeck(enclosing_body), e) {
+    if let Some(Constant::Int(v)) = constant(cx, cx.tcx.typeck(enclosing_body), e) {
         return value == v;
     }
     false
@@ -2385,7 +2409,7 @@ fn with_test_item_names(tcx: TyCtxt<'_>, module: LocalDefId, f: impl Fn(&[Symbol
 
 /// Checks if the function containing the given `HirId` is a `#[test]` function
 ///
-/// Note: Add `// compile-flags: --test` to UI tests with a `#[test]` function
+/// Note: Add `//@compile-flags: --test` to UI tests with a `#[test]` function
 pub fn is_in_test_function(tcx: TyCtxt<'_>, id: hir::HirId) -> bool {
     with_test_item_names(tcx, tcx.parent_module(id), |names| {
         tcx.hir()
@@ -2407,7 +2431,7 @@ pub fn is_in_test_function(tcx: TyCtxt<'_>, id: hir::HirId) -> bool {
 
 /// Checks if the item containing the given `HirId` has `#[cfg(test)]` attribute applied
 ///
-/// Note: Add `// compile-flags: --test` to UI tests with a `#[cfg(test)]` function
+/// Note: Add `//@compile-flags: --test` to UI tests with a `#[cfg(test)]` function
 pub fn is_in_cfg_test(tcx: TyCtxt<'_>, id: hir::HirId) -> bool {
     fn is_cfg_test(attr: &Attribute) -> bool {
         if attr.has_name(sym::cfg)
@@ -2429,7 +2453,7 @@ pub fn is_in_cfg_test(tcx: TyCtxt<'_>, id: hir::HirId) -> bool {
 /// Checks whether item either has `test` attribute applied, or
 /// is a module with `test` in its name.
 ///
-/// Note: Add `// compile-flags: --test` to UI tests with a `#[test]` function
+/// Note: Add `//@compile-flags: --test` to UI tests with a `#[test]` function
 pub fn is_test_module_or_function(tcx: TyCtxt<'_>, item: &Item<'_>) -> bool {
     is_in_test_function(tcx, item.hir_id())
         || matches!(item.kind, ItemKind::Mod(..))
@@ -2480,6 +2504,17 @@ pub fn walk_to_expr_usage<'tcx, T>(
     None
 }
 
+/// Tokenizes the input while keeping the text associated with each token.
+pub fn tokenize_with_text(s: &str) -> impl Iterator<Item = (TokenKind, &str)> {
+    let mut pos = 0;
+    tokenize(s).map(move |t| {
+        let end = pos + t.len;
+        let range = pos as usize..end as usize;
+        pos = end;
+        (t.kind, s.get(range).unwrap_or_default())
+    })
+}
+
 /// Checks whether a given span has any comment token
 /// This checks for all types of comment: line "//", block "/**", doc "///" "//!"
 pub fn span_contains_comment(sm: &SourceMap, span: Span) -> bool {
@@ -2496,23 +2531,11 @@ pub fn span_contains_comment(sm: &SourceMap, span: Span) -> bool {
 /// Comments are returned wrapped with their relevant delimiters
 pub fn span_extract_comment(sm: &SourceMap, span: Span) -> String {
     let snippet = sm.span_to_snippet(span).unwrap_or_default();
-    let mut comments_buf: Vec<String> = Vec::new();
-    let mut index: usize = 0;
-
-    for token in tokenize(&snippet) {
-        let token_range = index..(index + token.len as usize);
-        index += token.len as usize;
-        match token.kind {
-            TokenKind::BlockComment { .. } | TokenKind::LineComment { .. } => {
-                if let Some(comment) = snippet.get(token_range) {
-                    comments_buf.push(comment.to_string());
-                }
-            },
-            _ => (),
-        }
-    }
-
-    comments_buf.join("\n")
+    let res = tokenize_with_text(&snippet)
+        .filter(|(t, _)| matches!(t, TokenKind::BlockComment { .. } | TokenKind::LineComment { .. }))
+        .map(|(_, s)| s)
+        .join("\n");
+    res
 }
 
 pub fn span_find_starting_semi(sm: &SourceMap, span: Span) -> Span {

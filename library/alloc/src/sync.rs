@@ -33,7 +33,7 @@ use core::sync::atomic::Ordering::{Acquire, Relaxed, Release};
 #[cfg(not(no_global_oom_handling))]
 use crate::alloc::handle_alloc_error;
 #[cfg(not(no_global_oom_handling))]
-use crate::alloc::{box_free, WriteCloneIntoRaw};
+use crate::alloc::WriteCloneIntoRaw;
 use crate::alloc::{AllocError, Allocator, Global, Layout};
 use crate::borrow::{Cow, ToOwned};
 use crate::boxed::Box;
@@ -502,6 +502,7 @@ impl<T> Arc<T> {
     /// assert_eq!(*five, 5)
     /// ```
     #[cfg(not(no_global_oom_handling))]
+    #[inline]
     #[unstable(feature = "new_uninit", issue = "63291")]
     #[must_use]
     pub fn new_uninit() -> Arc<mem::MaybeUninit<T>> {
@@ -535,6 +536,7 @@ impl<T> Arc<T> {
     ///
     /// [zeroed]: mem::MaybeUninit::zeroed
     #[cfg(not(no_global_oom_handling))]
+    #[inline]
     #[unstable(feature = "new_uninit", issue = "63291")]
     #[must_use]
     pub fn new_zeroed() -> Arc<mem::MaybeUninit<T>> {
@@ -844,6 +846,7 @@ impl<T> Arc<[T]> {
     /// assert_eq!(*values, [1, 2, 3])
     /// ```
     #[cfg(not(no_global_oom_handling))]
+    #[inline]
     #[unstable(feature = "new_uninit", issue = "63291")]
     #[must_use]
     pub fn new_uninit_slice(len: usize) -> Arc<[mem::MaybeUninit<T>]> {
@@ -871,6 +874,7 @@ impl<T> Arc<[T]> {
     ///
     /// [zeroed]: mem::MaybeUninit::zeroed
     #[cfg(not(no_global_oom_handling))]
+    #[inline]
     #[unstable(feature = "new_uninit", issue = "63291")]
     #[must_use]
     pub fn new_zeroed_slice(len: usize) -> Arc<[mem::MaybeUninit<T>]> {
@@ -1263,7 +1267,7 @@ impl<T: ?Sized> Arc<T> {
     }
 
     /// Returns `true` if the two `Arc`s point to the same allocation in a vein similar to
-    /// [`ptr::eq`]. See [that function][`ptr::eq`] for caveats when comparing `dyn Trait` pointers.
+    /// [`ptr::eq`]. This function ignores the metadata of  `dyn Trait` pointers.
     ///
     /// # Examples
     ///
@@ -1283,7 +1287,7 @@ impl<T: ?Sized> Arc<T> {
     #[must_use]
     #[stable(feature = "ptr_eq", since = "1.17.0")]
     pub fn ptr_eq(this: &Self, other: &Self) -> bool {
-        this.ptr.as_ptr() == other.ptr.as_ptr()
+        this.ptr.as_ptr() as *const () == other.ptr.as_ptr() as *const ()
     }
 }
 
@@ -1300,10 +1304,10 @@ impl<T: ?Sized> Arc<T> {
         mem_to_arcinner: impl FnOnce(*mut u8) -> *mut ArcInner<T>,
     ) -> *mut ArcInner<T> {
         let layout = arcinner_layout_for_value_layout(value_layout);
-        unsafe {
-            Arc::try_allocate_for_layout(value_layout, allocate, mem_to_arcinner)
-                .unwrap_or_else(|_| handle_alloc_error(layout))
-        }
+
+        let ptr = allocate(layout).unwrap_or_else(|_| handle_alloc_error(layout));
+
+        unsafe { Self::initialize_arcinner(ptr, layout, mem_to_arcinner) }
     }
 
     /// Allocates an `ArcInner<T>` with sufficient space for
@@ -1321,7 +1325,16 @@ impl<T: ?Sized> Arc<T> {
 
         let ptr = allocate(layout)?;
 
-        // Initialize the ArcInner
+        let inner = unsafe { Self::initialize_arcinner(ptr, layout, mem_to_arcinner) };
+
+        Ok(inner)
+    }
+
+    unsafe fn initialize_arcinner(
+        ptr: NonNull<[u8]>,
+        layout: Layout,
+        mem_to_arcinner: impl FnOnce(*mut u8) -> *mut ArcInner<T>,
+    ) -> *mut ArcInner<T> {
         let inner = mem_to_arcinner(ptr.as_non_null_ptr().as_ptr());
         debug_assert_eq!(unsafe { Layout::for_value(&*inner) }, layout);
 
@@ -1330,7 +1343,7 @@ impl<T: ?Sized> Arc<T> {
             ptr::write(&mut (*inner).weak, atomic::AtomicUsize::new(1));
         }
 
-        Ok(inner)
+        inner
     }
 
     /// Allocates an `ArcInner<T>` with sufficient space for an unsized inner value.
@@ -1347,23 +1360,21 @@ impl<T: ?Sized> Arc<T> {
     }
 
     #[cfg(not(no_global_oom_handling))]
-    fn from_box(v: Box<T>) -> Arc<T> {
+    fn from_box(src: Box<T>) -> Arc<T> {
         unsafe {
-            let (box_unique, alloc) = Box::into_unique(v);
-            let bptr = box_unique.as_ptr();
-
-            let value_size = size_of_val(&*bptr);
-            let ptr = Self::allocate_for_ptr(bptr);
+            let value_size = size_of_val(&*src);
+            let ptr = Self::allocate_for_ptr(&*src);
 
             // Copy value as bytes
             ptr::copy_nonoverlapping(
-                bptr as *const T as *const u8,
+                &*src as *const T as *const u8,
                 &mut (*ptr).data as *mut _ as *mut u8,
                 value_size,
             );
 
             // Free the allocation without dropping its contents
-            box_free(box_unique, alloc);
+            let src = Box::from_raw(Box::into_raw(src) as *mut mem::ManuallyDrop<T>);
+            drop(src);
 
             Self::from_ptr(ptr)
         }
@@ -2243,8 +2254,8 @@ impl<T: ?Sized> Weak<T> {
     }
 
     /// Returns `true` if the two `Weak`s point to the same allocation similar to [`ptr::eq`], or if
-    /// both don't point to any allocation (because they were created with `Weak::new()`). See [that
-    /// function][`ptr::eq`] for caveats when comparing `dyn Trait` pointers.
+    /// both don't point to any allocation (because they were created with `Weak::new()`). However,
+    /// this function ignores the metadata of  `dyn Trait` pointers.
     ///
     /// # Notes
     ///
@@ -2287,7 +2298,7 @@ impl<T: ?Sized> Weak<T> {
     #[must_use]
     #[stable(feature = "weak_ptr_eq", since = "1.39.0")]
     pub fn ptr_eq(&self, other: &Self) -> bool {
-        self.ptr.as_ptr() == other.ptr.as_ptr()
+        ptr::eq(self.ptr.as_ptr() as *const (), other.ptr.as_ptr() as *const ())
     }
 }
 

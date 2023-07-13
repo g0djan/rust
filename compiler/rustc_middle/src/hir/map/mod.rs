@@ -1,4 +1,5 @@
 use crate::hir::{ModuleItems, Owner};
+use crate::middle::debugger_visualizer::DebuggerVisualizerFile;
 use crate::query::LocalCrate;
 use crate::ty::TyCtxt;
 use rustc_ast as ast;
@@ -43,6 +44,7 @@ pub fn associated_body(node: Node<'_>) -> Option<(LocalDefId, BodyId)> {
         }
 
         Node::AnonConst(constant) => Some((constant.def_id, constant.body)),
+        Node::ConstBlock(constant) => Some((constant.def_id, constant.body)),
 
         _ => None,
     }
@@ -193,13 +195,7 @@ impl<'hir> Map<'hir> {
                 ItemKind::Fn(..) => DefKind::Fn,
                 ItemKind::Macro(_, macro_kind) => DefKind::Macro(macro_kind),
                 ItemKind::Mod(..) => DefKind::Mod,
-                ItemKind::OpaqueTy(ref opaque) => {
-                    if opaque.in_trait && !self.tcx.lower_impl_trait_in_trait_to_assoc_ty() {
-                        DefKind::ImplTraitPlaceholder
-                    } else {
-                        DefKind::OpaqueTy
-                    }
-                }
+                ItemKind::OpaqueTy(..) => DefKind::OpaqueTy,
                 ItemKind::TyAlias(..) => DefKind::TyAlias,
                 ItemKind::Enum(..) => DefKind::Enum,
                 ItemKind::Struct(..) => DefKind::Struct,
@@ -239,15 +235,8 @@ impl<'hir> Map<'hir> {
                     None => bug!("constructor node without a constructor"),
                 }
             }
-            Node::AnonConst(_) => {
-                let inline = match self.find_parent(hir_id) {
-                    Some(Node::Expr(&Expr {
-                        kind: ExprKind::ConstBlock(ref anon_const), ..
-                    })) if anon_const.hir_id == hir_id => true,
-                    _ => false,
-                };
-                if inline { DefKind::InlineConst } else { DefKind::AnonConst }
-            }
+            Node::AnonConst(_) => DefKind::AnonConst,
+            Node::ConstBlock(_) => DefKind::InlineConst,
             Node::Field(_) => DefKind::Field,
             Node::Expr(expr) => match expr.kind {
                 ExprKind::Closure(Closure { movability: None, .. }) => DefKind::Closure,
@@ -409,7 +398,7 @@ impl<'hir> Map<'hir> {
     /// item (possibly associated), a closure, or a `hir::AnonConst`.
     pub fn body_owner(self, BodyId { hir_id }: BodyId) -> HirId {
         let parent = self.parent_id(hir_id);
-        assert!(self.find(parent).map_or(false, |n| is_body_owner(n, hir_id)), "{hir_id:?}");
+        assert!(self.find(parent).is_some_and(|n| is_body_owner(n, hir_id)), "{hir_id:?}");
         parent
     }
 
@@ -1059,6 +1048,7 @@ impl<'hir> Map<'hir> {
             Node::Variant(variant) => variant.span,
             Node::Field(field) => field.span,
             Node::AnonConst(constant) => self.body(constant.body).value.span,
+            Node::ConstBlock(constant) => self.body(constant.body).value.span,
             Node::Expr(expr) => expr.span,
             Node::ExprField(field) => field.span,
             Node::Stmt(stmt) => stmt.span,
@@ -1165,11 +1155,26 @@ pub(super) fn crate_hash(tcx: TyCtxt<'_>, _: LocalCrate) -> Svh {
 
     source_file_names.sort_unstable();
 
+    // We have to take care of debugger visualizers explicitly. The HIR (and
+    // thus `hir_body_hash`) contains the #[debugger_visualizer] attributes but
+    // these attributes only store the file path to the visualizer file, not
+    // their content. Yet that content is exported into crate metadata, so any
+    // changes to it need to be reflected in the crate hash.
+    let debugger_visualizers: Vec<_> = tcx
+        .debugger_visualizers(LOCAL_CRATE)
+        .iter()
+        // We ignore the path to the visualizer file since it's not going to be
+        // encoded in crate metadata and we already hash the full contents of
+        // the file.
+        .map(DebuggerVisualizerFile::path_erased)
+        .collect();
+
     let crate_hash: Fingerprint = tcx.with_stable_hashing_context(|mut hcx| {
         let mut stable_hasher = StableHasher::new();
         hir_body_hash.hash_stable(&mut hcx, &mut stable_hasher);
         upstream_crates.hash_stable(&mut hcx, &mut stable_hasher);
         source_file_names.hash_stable(&mut hcx, &mut stable_hasher);
+        debugger_visualizers.hash_stable(&mut hcx, &mut stable_hasher);
         if tcx.sess.opts.incremental_relative_spans() {
             let definitions = tcx.definitions_untracked();
             let mut owner_spans: Vec<_> = krate
@@ -1273,6 +1278,7 @@ fn hir_id_to_string(map: Map<'_>, id: HirId) -> String {
             format!("{id} (field `{}` in {})", field.ident, path_str(field.def_id))
         }
         Some(Node::AnonConst(_)) => node_str("const"),
+        Some(Node::ConstBlock(_)) => node_str("const"),
         Some(Node::Expr(_)) => node_str("expr"),
         Some(Node::ExprField(_)) => node_str("expr field"),
         Some(Node::Stmt(_)) => node_str("stmt"),
@@ -1416,6 +1422,11 @@ impl<'hir> Visitor<'hir> for ItemCollector<'hir> {
     fn visit_anon_const(&mut self, c: &'hir AnonConst) {
         self.body_owners.push(c.def_id);
         intravisit::walk_anon_const(self, c)
+    }
+
+    fn visit_inline_const(&mut self, c: &'hir ConstBlock) {
+        self.body_owners.push(c.def_id);
+        intravisit::walk_inline_const(self, c)
     }
 
     fn visit_expr(&mut self, ex: &'hir Expr<'hir>) {

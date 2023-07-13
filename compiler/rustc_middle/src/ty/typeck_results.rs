@@ -7,11 +7,8 @@ use crate::{
         GenericArgKind, InternalSubsts, SubstsRef, Ty, UserSubsts,
     },
 };
-use rustc_data_structures::{
-    fx::{FxHashMap, FxIndexMap},
-    sync::Lrc,
-    unord::{UnordItems, UnordSet},
-};
+use rustc_data_structures::fx::{FxHashMap, FxIndexMap};
+use rustc_data_structures::unord::{UnordItems, UnordSet};
 use rustc_errors::ErrorGuaranteed;
 use rustc_hir as hir;
 use rustc_hir::{
@@ -145,17 +142,17 @@ pub struct TypeckResults<'tcx> {
     /// This is used for warning unused imports. During type
     /// checking, this `Lrc` should not be cloned: it must have a ref-count
     /// of 1 so that we can insert things into the set mutably.
-    pub used_trait_imports: Lrc<UnordSet<LocalDefId>>,
+    pub used_trait_imports: UnordSet<LocalDefId>,
 
     /// If any errors occurred while type-checking this body,
     /// this field will be set to `Some(ErrorGuaranteed)`.
     pub tainted_by_errors: Option<ErrorGuaranteed>,
 
-    /// All the opaque types that have hidden types set
-    /// by this function. We also store the
-    /// type here, so that mir-borrowck can use it as a hint for figuring out hidden types,
-    /// even if they are only set in dead code (which doesn't show up in MIR).
-    pub concrete_opaque_types: FxIndexMap<LocalDefId, ty::OpaqueHiddenType<'tcx>>,
+    /// All the opaque types that have hidden types set by this function.
+    /// We also store the type here, so that the compiler can use it as a hint
+    /// for figuring out hidden types, even if they are only set in dead code
+    /// (which doesn't show up in MIR).
+    pub concrete_opaque_types: FxIndexMap<ty::OpaqueTypeKey<'tcx>, ty::OpaqueHiddenType<'tcx>>,
 
     /// Tracks the minimum captures required for a closure;
     /// see `MinCaptureInformationMap` for more details.
@@ -273,7 +270,7 @@ impl<'tcx> TypeckResults<'tcx> {
             liberated_fn_sigs: Default::default(),
             fru_field_types: Default::default(),
             coercion_casts: Default::default(),
-            used_trait_imports: Lrc::new(Default::default()),
+            used_trait_imports: Default::default(),
             tainted_by_errors: None,
             concrete_opaque_types: Default::default(),
             closure_min_captures: Default::default(),

@@ -13,8 +13,8 @@ use rustc_interface::interface;
 use rustc_middle::hir::nested_filter;
 use rustc_middle::ty::{ParamEnv, Ty, TyCtxt};
 use rustc_session::config::{self, CrateType, ErrorOutputType, ResolveDocLinks};
-use rustc_session::lint;
 use rustc_session::Session;
+use rustc_session::{lint, EarlyErrorHandler};
 use rustc_span::symbol::sym;
 use rustc_span::{source_map, Span};
 
@@ -181,6 +181,7 @@ pub(crate) fn new_handler(
 
 /// Parse, resolve, and typecheck the given crate.
 pub(crate) fn create_config(
+    handler: &EarlyErrorHandler,
     RustdocOptions {
         input,
         crate_name,
@@ -258,8 +259,8 @@ pub(crate) fn create_config(
 
     interface::Config {
         opts: sessopts,
-        crate_cfg: interface::parse_cfgspecs(cfgs),
-        crate_check_cfg: interface::parse_check_cfg(check_cfgs),
+        crate_cfg: interface::parse_cfgspecs(handler, cfgs),
+        crate_check_cfg: interface::parse_check_cfg(handler, check_cfgs),
         input,
         output_file: None,
         output_dir: None,
@@ -367,7 +368,7 @@ pub(crate) fn run_global_ctxt(
 
     let mut krate = tcx.sess.time("clean_crate", || clean::krate(&mut ctxt));
 
-    if krate.module.doc_value().map(|d| d.is_empty()).unwrap_or(true) {
+    if krate.module.doc_value().is_empty() {
         let help = format!(
             "The following guide may be of use:\n\
             {}/rustdoc/how-to-write-documentation.html",

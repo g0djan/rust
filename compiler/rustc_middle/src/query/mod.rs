@@ -12,6 +12,7 @@ use crate::infer::canonical::{self, Canonical};
 use crate::lint::LintExpectation;
 use crate::metadata::ModChild;
 use crate::middle::codegen_fn_attrs::CodegenFnAttrs;
+use crate::middle::debugger_visualizer::DebuggerVisualizerFile;
 use crate::middle::exported_symbols::{ExportedSymbol, SymbolExportInfo};
 use crate::middle::lib_features::LibFeatures;
 use crate::middle::privacy::EffectiveVisibilities;
@@ -37,7 +38,10 @@ use crate::traits::query::{
     OutlivesBound,
 };
 use crate::traits::specialization_graph;
-use crate::traits::{self, ImplSource};
+use crate::traits::{
+    CodegenObligationError, EvaluationResult, ImplSource, ObjectSafetyViolation, ObligationCause,
+    OverflowError, WellFormedLoc,
+};
 use crate::ty::fast_reject::SimplifiedType;
 use crate::ty::layout::ValidityRequirement;
 use crate::ty::subst::{GenericArg, SubstsRef};
@@ -50,7 +54,7 @@ use crate::ty::{
 };
 use rustc_arena::TypedArena;
 use rustc_ast as ast;
-use rustc_ast::expand::allocator::AllocatorKind;
+use rustc_ast::expand::{allocator::AllocatorKind, StrippedCfgItem};
 use rustc_attr as attr;
 use rustc_data_structures::fingerprint::Fingerprint;
 use rustc_data_structures::fx::{FxHashMap, FxIndexMap, FxIndexSet};
@@ -342,7 +346,7 @@ rustc_queries! {
     /// `key` is the `DefId` of the associated type or opaque type.
     ///
     /// Bounds from the parent (e.g. with nested impl trait) are not included.
-    query explicit_item_bounds(key: DefId) -> ty::EarlyBinder<&'tcx [(ty::Predicate<'tcx>, Span)]> {
+    query explicit_item_bounds(key: DefId) -> ty::EarlyBinder<&'tcx [(ty::Clause<'tcx>, Span)]> {
         desc { |tcx| "finding item bounds for `{}`", tcx.def_path_str(key) }
         cache_on_disk_if { key.is_local() }
         separate_provide_extern
@@ -369,7 +373,7 @@ rustc_queries! {
     /// ```
     ///
     /// Bounds from the parent (e.g. with nested impl trait) are not included.
-    query item_bounds(key: DefId) -> ty::EarlyBinder<&'tcx ty::List<ty::Predicate<'tcx>>> {
+    query item_bounds(key: DefId) -> ty::EarlyBinder<&'tcx ty::List<ty::Clause<'tcx>>> {
         desc { |tcx| "elaborating item bounds for `{}`", tcx.def_path_str(key) }
     }
 
@@ -525,6 +529,19 @@ rustc_queries! {
             |tcx| "finding symbols for captures of closure `{}`",
             tcx.def_path_str(key)
         }
+    }
+
+    /// Returns names of captured upvars for closures and generators.
+    ///
+    /// Here are some examples:
+    ///  - `name__field1__field2` when the upvar is captured by value.
+    ///  - `_ref__name__field` when the upvar is captured by reference.
+    ///
+    /// For generators this only contains upvars that are shared by all states.
+    query closure_saved_names_of_captured_variables(def_id: DefId) -> &'tcx IndexVec<abi::FieldIdx, Symbol> {
+        arena_cache
+        desc { |tcx| "computing debuginfo for closure `{}`", tcx.def_path_str(def_id) }
+        separate_provide_extern
     }
 
     query mir_generator_witnesses(key: DefId) -> &'tcx Option<mir::GeneratorLayout<'tcx>> {
@@ -864,7 +881,7 @@ rustc_queries! {
     ///
     /// Note that we've liberated the late bound regions of function signatures, so
     /// this can not be used to check whether these types are well formed.
-    query assumed_wf_types(key: DefId) -> &'tcx ty::List<Ty<'tcx>> {
+    query assumed_wf_types(key: LocalDefId) -> &'tcx [(Ty<'tcx>, Span)] {
         desc { |tcx| "computing the implied bounds of `{}`", tcx.def_path_str(key) }
     }
 
@@ -1070,19 +1087,13 @@ rustc_queries! {
     }
 
     /// Tries to destructure an `mir::ConstantKind` ADT or array into its variant index
-    /// and its field values.
-    query try_destructure_mir_constant(
-        key: ty::ParamEnvAnd<'tcx, mir::ConstantKind<'tcx>>
+    /// and its field values. This should only be used for pretty printing.
+    query try_destructure_mir_constant_for_diagnostics(
+        key: (ConstValue<'tcx>, Ty<'tcx>)
     ) -> Option<mir::DestructuredConstant<'tcx>> {
         desc { "destructuring MIR constant"}
-    }
-
-    /// Dereference a constant reference or raw pointer and turn the result into a constant
-    /// again.
-    query deref_mir_constant(
-        key: ty::ParamEnvAnd<'tcx, mir::ConstantKind<'tcx>>
-    ) -> mir::ConstantKind<'tcx> {
-        desc { "dereferencing MIR constant" }
+        no_hash
+        eval_always
     }
 
     query const_caller_location(key: (rustc_span::Symbol, u32, u32)) -> ConstValue<'tcx> {
@@ -1094,10 +1105,6 @@ rustc_queries! {
         key: LitToConstInput<'tcx>
     ) -> Result<ty::Const<'tcx>, LitToConstError> {
         desc { "converting literal to const" }
-    }
-
-    query lit_to_mir_constant(key: LitToConstInput<'tcx>) -> Result<mir::ConstantKind<'tcx>, LitToConstError> {
-        desc { "converting literal to mir constant" }
     }
 
     query check_match(key: LocalDefId) -> Result<(), rustc_errors::ErrorGuaranteed> {
@@ -1271,8 +1278,8 @@ rustc_queries! {
     }
 
     query codegen_select_candidate(
-        key: (ty::ParamEnv<'tcx>, ty::PolyTraitRef<'tcx>)
-    ) -> Result<&'tcx ImplSource<'tcx, ()>, traits::CodegenObligationError> {
+        key: (ty::ParamEnv<'tcx>, ty::TraitRef<'tcx>)
+    ) -> Result<&'tcx ImplSource<'tcx, ()>, CodegenObligationError> {
         cache_on_disk_if { true }
         desc { |tcx| "computing candidate for `{}`", key.1 }
     }
@@ -1293,7 +1300,7 @@ rustc_queries! {
         desc { |tcx| "building specialization graph of trait `{}`", tcx.def_path_str(trait_id) }
         cache_on_disk_if { true }
     }
-    query object_safety_violations(trait_id: DefId) -> &'tcx [traits::ObjectSafetyViolation] {
+    query object_safety_violations(trait_id: DefId) -> &'tcx [ObjectSafetyViolation] {
         desc { |tcx| "determining object safety of trait `{}`", tcx.def_path_str(trait_id) }
     }
     query check_is_object_safe(trait_id: DefId) -> bool {
@@ -1378,7 +1385,7 @@ rustc_queries! {
     /// executes in "reveal all" mode, and will normalize the input type.
     query layout_of(
         key: ty::ParamEnvAnd<'tcx, Ty<'tcx>>
-    ) -> Result<ty::layout::TyAndLayout<'tcx>, ty::layout::LayoutError<'tcx>> {
+    ) -> Result<ty::layout::TyAndLayout<'tcx>, &'tcx ty::layout::LayoutError<'tcx>> {
         depth_limit
         desc { "computing layout of `{}`", key.value }
     }
@@ -1389,7 +1396,7 @@ rustc_queries! {
     /// instead, where the instance is an `InstanceDef::Virtual`.
     query fn_abi_of_fn_ptr(
         key: ty::ParamEnvAnd<'tcx, (ty::PolyFnSig<'tcx>, &'tcx ty::List<Ty<'tcx>>)>
-    ) -> Result<&'tcx abi::call::FnAbi<'tcx, Ty<'tcx>>, ty::layout::FnAbiError<'tcx>> {
+    ) -> Result<&'tcx abi::call::FnAbi<'tcx, Ty<'tcx>>, &'tcx ty::layout::FnAbiError<'tcx>> {
         desc { "computing call ABI of `{}` function pointers", key.value.0 }
     }
 
@@ -1400,7 +1407,7 @@ rustc_queries! {
     /// to an `InstanceDef::Virtual` instance (of `<dyn Trait as Trait>::fn`).
     query fn_abi_of_instance(
         key: ty::ParamEnvAnd<'tcx, (ty::Instance<'tcx>, &'tcx ty::List<Ty<'tcx>>)>
-    ) -> Result<&'tcx abi::call::FnAbi<'tcx, Ty<'tcx>>, ty::layout::FnAbiError<'tcx>> {
+    ) -> Result<&'tcx abi::call::FnAbi<'tcx, Ty<'tcx>>, &'tcx ty::layout::FnAbiError<'tcx>> {
         desc { "computing call ABI of `{}`", key.value.0 }
     }
 
@@ -1483,8 +1490,9 @@ rustc_queries! {
         desc { "getting traits in scope at a block" }
     }
 
-    query impl_defaultness(def_id: DefId) -> hir::Defaultness {
-        desc { |tcx| "looking up whether `{}` is a default impl", tcx.def_path_str(def_id) }
+    /// Returns whether the impl or associated function has the `default` keyword.
+    query defaultness(def_id: DefId) -> hir::Defaultness {
+        desc { |tcx| "looking up whether `{}` has `default`", tcx.def_path_str(def_id) }
         separate_provide_extern
         feedable
     }
@@ -1784,12 +1792,18 @@ rustc_queries! {
         desc { "looking at the source for a crate" }
         separate_provide_extern
     }
+
     /// Returns the debugger visualizers defined for this crate.
-    query debugger_visualizers(_: CrateNum) -> &'tcx Vec<rustc_span::DebuggerVisualizerFile> {
+    /// NOTE: This query has to be marked `eval_always` because it reads data
+    ///       directly from disk that is not tracked anywhere else. I.e. it
+    ///       represents a genuine input to the query system.
+    query debugger_visualizers(_: CrateNum) -> &'tcx Vec<DebuggerVisualizerFile> {
         arena_cache
         desc { "looking up the debugger visualizers for this crate" }
         separate_provide_extern
+        eval_always
     }
+
     query postorder_cnums(_: ()) -> &'tcx [CrateNum] {
         eval_always
         desc { "generating a postorder list of CrateNums" }
@@ -1831,8 +1845,7 @@ rustc_queries! {
     }
 
     /// A list of all traits in a crate, used by rustdoc and error reporting.
-    /// NOTE: Not named just `traits` due to a naming conflict.
-    query traits_in_crate(_: CrateNum) -> &'tcx [DefId] {
+    query traits(_: CrateNum) -> &'tcx [DefId] {
         desc { "fetching all traits in a crate" }
         separate_provide_extern
     }
@@ -1906,6 +1919,16 @@ rustc_queries! {
     }
 
     /// Do not call this query directly: invoke `normalize` instead.
+    query normalize_weak_ty(
+        goal: CanonicalProjectionGoal<'tcx>
+    ) -> Result<
+        &'tcx Canonical<'tcx, canonical::QueryResponse<'tcx, NormalizationResult<'tcx>>>,
+        NoSolution,
+    > {
+        desc { "normalizing `{}`", goal.value.value }
+    }
+
+    /// Do not call this query directly: invoke `normalize` instead.
     query normalize_inherent_projection_ty(
         goal: CanonicalProjectionGoal<'tcx>
     ) -> Result<
@@ -1946,17 +1969,8 @@ rustc_queries! {
     /// `infcx.predicate_must_hold()` instead.
     query evaluate_obligation(
         goal: CanonicalPredicateGoal<'tcx>
-    ) -> Result<traits::EvaluationResult, traits::OverflowError> {
+    ) -> Result<EvaluationResult, OverflowError> {
         desc { "evaluating trait selection obligation `{}`", goal.value.value }
-    }
-
-    query evaluate_goal(
-        goal: traits::CanonicalChalkEnvironmentAndGoal<'tcx>
-    ) -> Result<
-        &'tcx Canonical<'tcx, canonical::QueryResponse<'tcx, ()>>,
-        NoSolution
-    > {
-        desc { "evaluating trait selection obligation `{}`", goal.value }
     }
 
     /// Do not call this query directly: part of the `Eq` type-op
@@ -2010,10 +2024,10 @@ rustc_queries! {
     }
 
     /// Do not call this query directly: part of the `Normalize` type-op
-    query type_op_normalize_predicate(
-        goal: CanonicalTypeOpNormalizeGoal<'tcx, ty::Predicate<'tcx>>
+    query type_op_normalize_clause(
+        goal: CanonicalTypeOpNormalizeGoal<'tcx, ty::Clause<'tcx>>
     ) -> Result<
-        &'tcx Canonical<'tcx, canonical::QueryResponse<'tcx, ty::Predicate<'tcx>>>,
+        &'tcx Canonical<'tcx, canonical::QueryResponse<'tcx, ty::Clause<'tcx>>>,
         NoSolution,
     > {
         desc { "normalizing `{:?}`", goal.value.value.value }
@@ -2104,7 +2118,7 @@ rustc_queries! {
         desc { "resolving instance `{}`", ty::Instance::new(key.value.0, key.value.1) }
     }
 
-    query reveal_opaque_types_in_bounds(key: &'tcx ty::List<ty::Predicate<'tcx>>) -> &'tcx ty::List<ty::Predicate<'tcx>> {
+    query reveal_opaque_types_in_bounds(key: &'tcx ty::List<ty::Clause<'tcx>>) -> &'tcx ty::List<ty::Clause<'tcx>> {
         desc { "revealing opaque types in `{:?}`", key }
     }
 
@@ -2121,8 +2135,8 @@ rustc_queries! {
     /// all of the cases that the normal `ty::Ty`-based wfcheck does. This is fine,
     /// because the `ty::Ty`-based wfcheck is always run.
     query diagnostic_hir_wf_check(
-        key: (ty::Predicate<'tcx>, traits::WellFormedLoc)
-    ) -> &'tcx Option<traits::ObligationCause<'tcx>> {
+        key: (ty::Predicate<'tcx>, WellFormedLoc)
+    ) -> &'tcx Option<ObligationCause<'tcx>> {
         arena_cache
         eval_always
         no_hash
@@ -2143,7 +2157,7 @@ rustc_queries! {
         separate_provide_extern
     }
 
-    query check_validity_requirement(key: (ValidityRequirement, ty::ParamEnvAnd<'tcx, Ty<'tcx>>)) -> Result<bool, ty::layout::LayoutError<'tcx>> {
+    query check_validity_requirement(key: (ValidityRequirement, ty::ParamEnvAnd<'tcx, Ty<'tcx>>)) -> Result<bool, &'tcx ty::layout::LayoutError<'tcx>> {
         desc { "checking validity requirement for `{}`: {}", key.1.value, key.0 }
     }
 
@@ -2175,6 +2189,19 @@ rustc_queries! {
     /// the types might be equal.
     query check_tys_might_be_eq(arg: Canonical<'tcx, (ty::ParamEnv<'tcx>, Ty<'tcx>, Ty<'tcx>)>) -> Result<(), NoSolution> {
         desc { "check whether two const param are definitely not equal to eachother"}
+    }
+
+    /// Get all item paths that were stripped by a `#[cfg]` in a particular crate.
+    /// Should not be called for the local crate before the resolver outputs are created, as it
+    /// is only fed there.
+    query stripped_cfg_items(cnum: CrateNum) -> &'tcx [StrippedCfgItem] {
+        feedable
+        desc { "getting cfg-ed out item names" }
+        separate_provide_extern
+    }
+
+    query generics_require_sized_self(def_id: DefId) -> bool {
+        desc { "check whether the item has a `where Self: Sized` bound" }
     }
 }
 

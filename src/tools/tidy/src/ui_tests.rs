@@ -10,8 +10,8 @@ use std::path::{Path, PathBuf};
 
 const ENTRY_LIMIT: usize = 900;
 // FIXME: The following limits should be reduced eventually.
-const ISSUES_ENTRY_LIMIT: usize = 1920;
-const ROOT_ENTRY_LIMIT: usize = 896;
+const ISSUES_ENTRY_LIMIT: usize = 1896;
+const ROOT_ENTRY_LIMIT: usize = 870;
 
 const EXPECTED_TEST_FILE_EXTENSIONS: &[&str] = &[
     "rs",     // test source files
@@ -35,6 +35,7 @@ const EXTENSION_EXCEPTION_PATHS: &[&str] = &[
     "tests/ui/macros/syntax-extension-source-utils-files/includeme.fragment", // more include
     "tests/ui/unused-crate-deps/test.mk", // why would you use make
     "tests/ui/proc-macro/auxiliary/included-file.txt", // more include
+    "tests/ui/invalid/foo.natvis.xml", // sample debugger visualizer
 ];
 
 fn check_entries(tests_path: &Path, bad: &mut bool) {

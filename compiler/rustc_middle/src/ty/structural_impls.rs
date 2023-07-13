@@ -11,11 +11,14 @@ use crate::ty::{self, AliasTy, InferConst, Lift, Term, TermKind, Ty, TyCtxt};
 use rustc_hir::def::Namespace;
 use rustc_index::{Idx, IndexVec};
 use rustc_target::abi::TyAndLayout;
+use rustc_type_ir::{ConstKind, DebugWithInfcx, InferCtxtLike, OptWithInfcx};
 
-use std::fmt;
+use std::fmt::{self, Debug};
 use std::ops::ControlFlow;
 use std::rc::Rc;
 use std::sync::Arc;
+
+use super::{GenericArg, GenericArgKind, Region};
 
 impl fmt::Debug for ty::TraitDef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -88,7 +91,44 @@ impl fmt::Debug for ty::FreeRegion {
 
 impl<'tcx> fmt::Debug for ty::FnSig<'tcx> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "({:?}; c_variadic: {})->{:?}", self.inputs(), self.c_variadic, self.output())
+        OptWithInfcx::new_no_ctx(self).fmt(f)
+    }
+}
+impl<'tcx> DebugWithInfcx<TyCtxt<'tcx>> for ty::FnSig<'tcx> {
+    fn fmt<InfCtx: InferCtxtLike<TyCtxt<'tcx>>>(
+        this: OptWithInfcx<'_, TyCtxt<'tcx>, InfCtx, &Self>,
+        f: &mut core::fmt::Formatter<'_>,
+    ) -> core::fmt::Result {
+        let sig = this.data;
+        let ty::FnSig { inputs_and_output: _, c_variadic, unsafety, abi } = sig;
+
+        write!(f, "{}", unsafety.prefix_str())?;
+        match abi {
+            rustc_target::spec::abi::Abi::Rust => (),
+            abi => write!(f, "extern \"{abi:?}\" ")?,
+        };
+
+        write!(f, "fn(")?;
+        let inputs = sig.inputs();
+        match inputs.len() {
+            0 if *c_variadic => write!(f, "...)")?,
+            0 => write!(f, ")")?,
+            _ => {
+                for ty in &sig.inputs()[0..(sig.inputs().len() - 1)] {
+                    write!(f, "{:?}, ", &this.wrap(ty))?;
+                }
+                write!(f, "{:?}", &this.wrap(sig.inputs().last().unwrap()))?;
+                if *c_variadic {
+                    write!(f, "...")?;
+                }
+                write!(f, ")")?;
+            }
+        }
+
+        match sig.output().kind() {
+            ty::Tuple(list) if list.is_empty() => Ok(()),
+            _ => write!(f, " -> {:?}", &this.wrap(sig.output())),
+        }
     }
 }
 
@@ -104,6 +144,14 @@ impl<'tcx> fmt::Debug for ty::TraitRef<'tcx> {
     }
 }
 
+impl<'tcx> ty::DebugWithInfcx<TyCtxt<'tcx>> for Ty<'tcx> {
+    fn fmt<InfCtx: InferCtxtLike<TyCtxt<'tcx>>>(
+        this: OptWithInfcx<'_, TyCtxt<'tcx>, InfCtx, &Self>,
+        f: &mut core::fmt::Formatter<'_>,
+    ) -> core::fmt::Result {
+        this.data.fmt(f)
+    }
+}
 impl<'tcx> fmt::Debug for Ty<'tcx> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         with_no_trimmed_paths!(fmt::Display::fmt(self, f))
@@ -145,12 +193,22 @@ impl<'tcx> fmt::Debug for ty::Predicate<'tcx> {
 
 impl<'tcx> fmt::Debug for ty::Clause<'tcx> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:?}", self.kind())
+    }
+}
+
+impl<'tcx> fmt::Debug for ty::ClauseKind<'tcx> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
-            ty::Clause::ConstArgHasType(ct, ty) => write!(f, "ConstArgHasType({ct:?}, {ty:?})"),
-            ty::Clause::Trait(ref a) => a.fmt(f),
-            ty::Clause::RegionOutlives(ref pair) => pair.fmt(f),
-            ty::Clause::TypeOutlives(ref pair) => pair.fmt(f),
-            ty::Clause::Projection(ref pair) => pair.fmt(f),
+            ty::ClauseKind::ConstArgHasType(ct, ty) => write!(f, "ConstArgHasType({ct:?}, {ty:?})"),
+            ty::ClauseKind::Trait(ref a) => a.fmt(f),
+            ty::ClauseKind::RegionOutlives(ref pair) => pair.fmt(f),
+            ty::ClauseKind::TypeOutlives(ref pair) => pair.fmt(f),
+            ty::ClauseKind::Projection(ref pair) => pair.fmt(f),
+            ty::ClauseKind::WellFormed(ref data) => write!(f, "WellFormed({:?})", data),
+            ty::ClauseKind::ConstEvaluatable(ct) => {
+                write!(f, "ConstEvaluatable({ct:?})")
+            }
         }
     }
 }
@@ -161,20 +219,13 @@ impl<'tcx> fmt::Debug for ty::PredicateKind<'tcx> {
             ty::PredicateKind::Clause(ref a) => a.fmt(f),
             ty::PredicateKind::Subtype(ref pair) => pair.fmt(f),
             ty::PredicateKind::Coerce(ref pair) => pair.fmt(f),
-            ty::PredicateKind::WellFormed(data) => write!(f, "WellFormed({:?})", data),
             ty::PredicateKind::ObjectSafe(trait_def_id) => {
                 write!(f, "ObjectSafe({:?})", trait_def_id)
             }
             ty::PredicateKind::ClosureKind(closure_def_id, closure_substs, kind) => {
                 write!(f, "ClosureKind({:?}, {:?}, {:?})", closure_def_id, closure_substs, kind)
             }
-            ty::PredicateKind::ConstEvaluatable(ct) => {
-                write!(f, "ConstEvaluatable({ct:?})")
-            }
             ty::PredicateKind::ConstEquate(c1, c2) => write!(f, "ConstEquate({:?}, {:?})", c1, c2),
-            ty::PredicateKind::TypeWellFormedFromEnv(ty) => {
-                write!(f, "TypeWellFormedFromEnv({:?})", ty)
-            }
             ty::PredicateKind::Ambiguous => write!(f, "Ambiguous"),
             ty::PredicateKind::AliasRelate(t1, t2, dir) => {
                 write!(f, "AliasRelate({t1:?}, {dir:?}, {t2:?})")
@@ -185,9 +236,17 @@ impl<'tcx> fmt::Debug for ty::PredicateKind<'tcx> {
 
 impl<'tcx> fmt::Debug for AliasTy<'tcx> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        OptWithInfcx::new_no_ctx(self).fmt(f)
+    }
+}
+impl<'tcx> DebugWithInfcx<TyCtxt<'tcx>> for AliasTy<'tcx> {
+    fn fmt<InfCtx: InferCtxtLike<TyCtxt<'tcx>>>(
+        this: OptWithInfcx<'_, TyCtxt<'tcx>, InfCtx, &Self>,
+        f: &mut core::fmt::Formatter<'_>,
+    ) -> core::fmt::Result {
         f.debug_struct("AliasTy")
-            .field("substs", &self.substs)
-            .field("def_id", &self.def_id)
+            .field("substs", &this.map(|data| data.substs))
+            .field("def_id", &this.data.def_id)
             .finish()
     }
 }
@@ -200,33 +259,172 @@ impl<'tcx> fmt::Debug for ty::InferConst<'tcx> {
         }
     }
 }
-
-impl<'tcx> fmt::Debug for ty::Const<'tcx> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // This reflects what `Const` looked liked before `Interned` was
-        // introduced. We print it like this to avoid having to update expected
-        // output in a lot of tests.
-        write!(f, "Const {{ ty: {:?}, kind: {:?} }}", self.ty(), self.kind())
+impl<'tcx> DebugWithInfcx<TyCtxt<'tcx>> for ty::InferConst<'tcx> {
+    fn fmt<InfCtx: InferCtxtLike<TyCtxt<'tcx>>>(
+        this: OptWithInfcx<'_, TyCtxt<'tcx>, InfCtx, &Self>,
+        f: &mut core::fmt::Formatter<'_>,
+    ) -> core::fmt::Result {
+        use ty::InferConst::*;
+        match this.infcx.and_then(|infcx| infcx.universe_of_ct(*this.data)) {
+            None => write!(f, "{:?}", this.data),
+            Some(universe) => match *this.data {
+                Var(vid) => write!(f, "?{}_{}c", vid.index, universe.index()),
+                Fresh(_) => {
+                    unreachable!()
+                }
+            },
+        }
     }
 }
 
-impl<'tcx> fmt::Debug for ty::ConstKind<'tcx> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        use ty::ConstKind::*;
-        match self {
-            Param(param) => write!(f, "{param:?}"),
-            Infer(var) => write!(f, "{var:?}"),
-            Bound(debruijn, var) => ty::print::debug_bound_var(f, *debruijn, *var),
-            Placeholder(placeholder) => {
-                ty::print::debug_placeholder_var(f, placeholder.universe, placeholder.bound)
+impl<'tcx> fmt::Debug for ty::consts::Expr<'tcx> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        OptWithInfcx::new_no_ctx(self).fmt(f)
+    }
+}
+impl<'tcx> DebugWithInfcx<TyCtxt<'tcx>> for ty::consts::Expr<'tcx> {
+    fn fmt<InfCtx: InferCtxtLike<TyCtxt<'tcx>>>(
+        this: OptWithInfcx<'_, TyCtxt<'tcx>, InfCtx, &Self>,
+        f: &mut core::fmt::Formatter<'_>,
+    ) -> core::fmt::Result {
+        match this.data {
+            ty::Expr::Binop(op, lhs, rhs) => {
+                write!(f, "({op:?}: {:?}, {:?})", &this.wrap(lhs), &this.wrap(rhs))
             }
-            Unevaluated(uv) => {
-                f.debug_tuple("Unevaluated").field(&uv.substs).field(&uv.def).finish()
+            ty::Expr::UnOp(op, rhs) => write!(f, "({op:?}: {:?})", &this.wrap(rhs)),
+            ty::Expr::FunctionCall(func, args) => {
+                write!(f, "{:?}(", &this.wrap(func))?;
+                for arg in args.as_slice().iter().rev().skip(1).rev() {
+                    write!(f, "{:?}, ", &this.wrap(arg))?;
+                }
+                if let Some(arg) = args.last() {
+                    write!(f, "{:?}", &this.wrap(arg))?;
+                }
+
+                write!(f, ")")
             }
-            Value(valtree) => write!(f, "{valtree:?}"),
-            Error(_) => write!(f, "[const error]"),
-            Expr(expr) => write!(f, "{expr:?}"),
+            ty::Expr::Cast(cast_kind, lhs, rhs) => {
+                write!(f, "({cast_kind:?}: {:?}, {:?})", &this.wrap(lhs), &this.wrap(rhs))
+            }
         }
+    }
+}
+
+impl<'tcx> fmt::Debug for ty::UnevaluatedConst<'tcx> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        OptWithInfcx::new_no_ctx(self).fmt(f)
+    }
+}
+impl<'tcx> DebugWithInfcx<TyCtxt<'tcx>> for ty::UnevaluatedConst<'tcx> {
+    fn fmt<InfCtx: InferCtxtLike<TyCtxt<'tcx>>>(
+        this: OptWithInfcx<'_, TyCtxt<'tcx>, InfCtx, &Self>,
+        f: &mut core::fmt::Formatter<'_>,
+    ) -> core::fmt::Result {
+        f.debug_struct("UnevaluatedConst")
+            .field("def", &this.data.def)
+            .field("substs", &this.wrap(this.data.substs))
+            .finish()
+    }
+}
+
+impl<'tcx> fmt::Debug for ty::Const<'tcx> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        OptWithInfcx::new_no_ctx(self).fmt(f)
+    }
+}
+impl<'tcx> DebugWithInfcx<TyCtxt<'tcx>> for ty::Const<'tcx> {
+    fn fmt<InfCtx: InferCtxtLike<TyCtxt<'tcx>>>(
+        this: OptWithInfcx<'_, TyCtxt<'tcx>, InfCtx, &Self>,
+        f: &mut core::fmt::Formatter<'_>,
+    ) -> core::fmt::Result {
+        // This reflects what `Const` looked liked before `Interned` was
+        // introduced. We print it like this to avoid having to update expected
+        // output in a lot of tests.
+        write!(
+            f,
+            "Const {{ ty: {:?}, kind: {:?} }}",
+            &this.map(|data| data.ty()),
+            &this.map(|data| data.kind())
+        )
+    }
+}
+
+impl fmt::Debug for ty::BoundTy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.kind {
+            ty::BoundTyKind::Anon => write!(f, "{:?}", self.var),
+            ty::BoundTyKind::Param(_, sym) => write!(f, "{sym:?}"),
+        }
+    }
+}
+
+impl<T: fmt::Debug> fmt::Debug for ty::Placeholder<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.universe == ty::UniverseIndex::ROOT {
+            write!(f, "!{:?}", self.bound)
+        } else {
+            write!(f, "!{}_{:?}", self.universe.index(), self.bound)
+        }
+    }
+}
+
+impl<'tcx> fmt::Debug for GenericArg<'tcx> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.unpack() {
+            GenericArgKind::Lifetime(lt) => lt.fmt(f),
+            GenericArgKind::Type(ty) => ty.fmt(f),
+            GenericArgKind::Const(ct) => ct.fmt(f),
+        }
+    }
+}
+impl<'tcx> DebugWithInfcx<TyCtxt<'tcx>> for GenericArg<'tcx> {
+    fn fmt<InfCtx: InferCtxtLike<TyCtxt<'tcx>>>(
+        this: OptWithInfcx<'_, TyCtxt<'tcx>, InfCtx, &Self>,
+        f: &mut core::fmt::Formatter<'_>,
+    ) -> core::fmt::Result {
+        match this.data.unpack() {
+            GenericArgKind::Lifetime(lt) => write!(f, "{:?}", &this.wrap(lt)),
+            GenericArgKind::Const(ct) => write!(f, "{:?}", &this.wrap(ct)),
+            GenericArgKind::Type(ty) => write!(f, "{:?}", &this.wrap(ty)),
+        }
+    }
+}
+
+impl<'tcx> fmt::Debug for Region<'tcx> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:?}", self.kind())
+    }
+}
+impl<'tcx> DebugWithInfcx<TyCtxt<'tcx>> for Region<'tcx> {
+    fn fmt<InfCtx: InferCtxtLike<TyCtxt<'tcx>>>(
+        this: OptWithInfcx<'_, TyCtxt<'tcx>, InfCtx, &Self>,
+        f: &mut core::fmt::Formatter<'_>,
+    ) -> core::fmt::Result {
+        write!(f, "{:?}", &this.map(|data| data.kind()))
+    }
+}
+
+impl<'tcx> DebugWithInfcx<TyCtxt<'tcx>> for ty::RegionVid {
+    fn fmt<InfCtx: InferCtxtLike<TyCtxt<'tcx>>>(
+        this: OptWithInfcx<'_, TyCtxt<'tcx>, InfCtx, &Self>,
+        f: &mut core::fmt::Formatter<'_>,
+    ) -> core::fmt::Result {
+        match this.infcx.and_then(|infcx| infcx.universe_of_lt(*this.data)) {
+            Some(universe) => write!(f, "'?{}_{}", this.data.index(), universe.index()),
+            None => write!(f, "{:?}", this.data),
+        }
+    }
+}
+
+impl<'tcx, T: DebugWithInfcx<TyCtxt<'tcx>>> DebugWithInfcx<TyCtxt<'tcx>> for ty::Binder<'tcx, T> {
+    fn fmt<InfCtx: InferCtxtLike<TyCtxt<'tcx>>>(
+        this: OptWithInfcx<'_, TyCtxt<'tcx>, InfCtx, &Self>,
+        f: &mut core::fmt::Formatter<'_>,
+    ) -> core::fmt::Result {
+        f.debug_tuple("Binder")
+            .field(&this.map(|data| data.as_ref().skip_binder()))
+            .field(&this.data.bound_vars())
+            .finish()
     }
 }
 
@@ -294,13 +492,14 @@ TrivialTypeTraversalAndLiftImpls! {
     crate::ty::AliasRelationDirection,
     crate::ty::Placeholder<crate::ty::BoundRegion>,
     crate::ty::Placeholder<crate::ty::BoundTy>,
+    crate::ty::Placeholder<ty::BoundVar>,
     crate::ty::ClosureKind,
     crate::ty::FreeRegion,
     crate::ty::InferTy,
     crate::ty::IntVarValue,
     crate::ty::ParamConst,
     crate::ty::ParamTy,
-    crate::ty::adjustment::PointerCast,
+    crate::ty::adjustment::PointerCoercion,
     crate::ty::RegionVid,
     crate::ty::UniverseIndex,
     crate::ty::Variance,
@@ -310,7 +509,6 @@ TrivialTypeTraversalAndLiftImpls! {
     interpret::Scalar,
     rustc_target::abi::Size,
     ty::BoundVar,
-    ty::Placeholder<ty::BoundVar>,
 }
 
 TrivialTypeTraversalAndLiftImpls! {
@@ -609,9 +807,25 @@ impl<'tcx> TypeFoldable<TyCtxt<'tcx>> for ty::Predicate<'tcx> {
     }
 }
 
+// FIXME(clause): This is wonky
+impl<'tcx> TypeFoldable<TyCtxt<'tcx>> for ty::Clause<'tcx> {
+    fn try_fold_with<F: FallibleTypeFolder<TyCtxt<'tcx>>>(
+        self,
+        folder: &mut F,
+    ) -> Result<Self, F::Error> {
+        Ok(folder.try_fold_predicate(self.as_predicate())?.expect_clause())
+    }
+}
+
 impl<'tcx> TypeVisitable<TyCtxt<'tcx>> for ty::Predicate<'tcx> {
     fn visit_with<V: TypeVisitor<TyCtxt<'tcx>>>(&self, visitor: &mut V) -> ControlFlow<V::BreakTy> {
         visitor.visit_predicate(*self)
+    }
+}
+
+impl<'tcx> TypeVisitable<TyCtxt<'tcx>> for ty::Clause<'tcx> {
+    fn visit_with<V: TypeVisitor<TyCtxt<'tcx>>>(&self, visitor: &mut V) -> ControlFlow<V::BreakTy> {
+        visitor.visit_predicate(self.as_predicate())
     }
 }
 
@@ -634,12 +848,12 @@ impl<'tcx> TypeSuperVisitable<TyCtxt<'tcx>> for ty::Predicate<'tcx> {
     }
 }
 
-impl<'tcx> TypeFoldable<TyCtxt<'tcx>> for &'tcx ty::List<ty::Predicate<'tcx>> {
+impl<'tcx> TypeFoldable<TyCtxt<'tcx>> for &'tcx ty::List<ty::Clause<'tcx>> {
     fn try_fold_with<F: FallibleTypeFolder<TyCtxt<'tcx>>>(
         self,
         folder: &mut F,
     ) -> Result<Self, F::Error> {
-        ty::util::fold_list(self, folder, |tcx, v| tcx.mk_predicates(v))
+        ty::util::fold_list(self, folder, |tcx, v| tcx.mk_clauses(v))
     }
 }
 
@@ -664,9 +878,20 @@ impl<'tcx> TypeSuperFoldable<TyCtxt<'tcx>> for ty::Const<'tcx> {
         folder: &mut F,
     ) -> Result<Self, F::Error> {
         let ty = self.ty().try_fold_with(folder)?;
-        let kind = self.kind().try_fold_with(folder)?;
+        let kind = match self.kind() {
+            ConstKind::Param(p) => ConstKind::Param(p.try_fold_with(folder)?),
+            ConstKind::Infer(i) => ConstKind::Infer(i.try_fold_with(folder)?),
+            ConstKind::Bound(d, b) => {
+                ConstKind::Bound(d.try_fold_with(folder)?, b.try_fold_with(folder)?)
+            }
+            ConstKind::Placeholder(p) => ConstKind::Placeholder(p.try_fold_with(folder)?),
+            ConstKind::Unevaluated(uv) => ConstKind::Unevaluated(uv.try_fold_with(folder)?),
+            ConstKind::Value(v) => ConstKind::Value(v.try_fold_with(folder)?),
+            ConstKind::Error(e) => ConstKind::Error(e.try_fold_with(folder)?),
+            ConstKind::Expr(e) => ConstKind::Expr(e.try_fold_with(folder)?),
+        };
         if ty != self.ty() || kind != self.kind() {
-            Ok(folder.interner().mk_const(kind, ty))
+            Ok(folder.interner().mk_ct_from_kind(kind, ty))
         } else {
             Ok(self)
         }
@@ -679,7 +904,19 @@ impl<'tcx> TypeSuperVisitable<TyCtxt<'tcx>> for ty::Const<'tcx> {
         visitor: &mut V,
     ) -> ControlFlow<V::BreakTy> {
         self.ty().visit_with(visitor)?;
-        self.kind().visit_with(visitor)
+        match self.kind() {
+            ConstKind::Param(p) => p.visit_with(visitor),
+            ConstKind::Infer(i) => i.visit_with(visitor),
+            ConstKind::Bound(d, b) => {
+                d.visit_with(visitor)?;
+                b.visit_with(visitor)
+            }
+            ConstKind::Placeholder(p) => p.visit_with(visitor),
+            ConstKind::Unevaluated(uv) => uv.visit_with(visitor),
+            ConstKind::Value(v) => v.visit_with(visitor),
+            ConstKind::Error(e) => e.visit_with(visitor),
+            ConstKind::Expr(e) => e.visit_with(visitor),
+        }
     }
 }
 

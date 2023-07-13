@@ -13,8 +13,9 @@ use rustc_index::IndexSlice;
 use rustc_infer::infer::LateBoundRegionConversionTime;
 use rustc_middle::mir::tcx::PlaceTy;
 use rustc_middle::mir::{
-    AggregateKind, Constant, FakeReadCause, Local, LocalInfo, LocalKind, Location, Operand, Place,
-    PlaceRef, ProjectionElem, Rvalue, Statement, StatementKind, Terminator, TerminatorKind,
+    AggregateKind, CallSource, Constant, FakeReadCause, Local, LocalInfo, LocalKind, Location,
+    Operand, Place, PlaceRef, ProjectionElem, Rvalue, Statement, StatementKind, Terminator,
+    TerminatorKind,
 };
 use rustc_middle::ty::print::Print;
 use rustc_middle::ty::{self, Instance, Ty, TyCtxt};
@@ -414,7 +415,12 @@ impl<'cx, 'tcx> MirBorrowckCtxt<'cx, 'tcx> {
                     if !is_terminator {
                         continue;
                     } else if let Some(Terminator {
-                        kind: TerminatorKind::Call { func, from_hir_call: false, .. },
+                        kind:
+                            TerminatorKind::Call {
+                                func,
+                                call_source: CallSource::OverloadedOperator,
+                                ..
+                            },
                         ..
                     }) = &bbd.terminator
                     {
@@ -622,8 +628,7 @@ impl UseSpans<'_> {
                 err.subdiagnostic(match kind {
                     Some(kd) => match kd {
                         rustc_middle::mir::BorrowKind::Shared
-                        | rustc_middle::mir::BorrowKind::Shallow
-                        | rustc_middle::mir::BorrowKind::Unique => {
+                        | rustc_middle::mir::BorrowKind::Shallow => {
                             CaptureVarKind::Immut { kind_span: capture_kind_span }
                         }
 
@@ -839,7 +844,7 @@ impl<'cx, 'tcx> MirBorrowckCtxt<'cx, 'tcx> {
         debug!("move_spans: target_temp = {:?}", target_temp);
 
         if let Some(Terminator {
-            kind: TerminatorKind::Call { fn_span, from_hir_call, .. }, ..
+            kind: TerminatorKind::Call { fn_span, call_source, .. }, ..
         }) = &self.body[location.block].terminator
         {
             let Some((method_did, method_substs)) =
@@ -859,7 +864,7 @@ impl<'cx, 'tcx> MirBorrowckCtxt<'cx, 'tcx> {
                 method_did,
                 method_substs,
                 *fn_span,
-                *from_hir_call,
+                call_source.from_hir_call(),
                 Some(self.infcx.tcx.fn_arg_names(method_did)[0]),
             );
 
@@ -1045,7 +1050,7 @@ impl<'cx, 'tcx> MirBorrowckCtxt<'cx, 'tcx> {
                             Some(def_id) => type_known_to_meet_bound_modulo_regions(
                                 &self.infcx,
                                 self.param_env,
-                                tcx.mk_imm_ref(tcx.lifetimes.re_erased, ty),
+                                Ty::new_imm_ref(tcx, tcx.lifetimes.re_erased, ty),
                                 def_id,
                             ),
                             _ => false,
@@ -1116,7 +1121,7 @@ impl<'cx, 'tcx> MirBorrowckCtxt<'cx, 'tcx> {
                             err.eager_subdiagnostic(
                                 &self.infcx.tcx.sess.parse_sess.span_diagnostic,
                                 CaptureReasonSuggest::FreshReborrow {
-                                    span: fn_call_span.shrink_to_lo(),
+                                    span: move_span.shrink_to_hi(),
                                 });
                         }
                         if let Some(clone_trait) = tcx.lang_items().clone_trait()
@@ -1130,10 +1135,10 @@ impl<'cx, 'tcx> MirBorrowckCtxt<'cx, 'tcx> {
                             && self.infcx.predicate_must_hold_modulo_regions(&o)
                         {
                             err.span_suggestion_verbose(
-                                fn_call_span.shrink_to_lo(),
+                                move_span.shrink_to_hi(),
                                 "you can `clone` the value and consume it, but this might not be \
                                  your desired behavior",
-                                "clone().".to_string(),
+                                ".clone()".to_string(),
                                 Applicability::MaybeIncorrect,
                             );
                         }
@@ -1141,6 +1146,12 @@ impl<'cx, 'tcx> MirBorrowckCtxt<'cx, 'tcx> {
                     // Avoid pointing to the same function in multiple different
                     // error messages.
                     if span != DUMMY_SP && self.fn_self_span_reported.insert(self_arg.span) {
+                        self.explain_iterator_advancement_in_for_loop_if_applicable(
+                            err,
+                            span,
+                            &move_spans,
+                        );
+
                         let func = tcx.def_path_str(method_did);
                         err.subdiagnostic(CaptureReasonNote::FuncTakeSelf {
                             func,
@@ -1156,7 +1167,7 @@ impl<'cx, 'tcx> MirBorrowckCtxt<'cx, 'tcx> {
                                 ty::Adt(def, ..) => Some(def.did()),
                                 _ => None,
                             });
-                    let is_option_or_result = parent_self_ty.map_or(false, |def_id| {
+                    let is_option_or_result = parent_self_ty.is_some_and(|def_id| {
                         matches!(tcx.get_diagnostic_name(def_id), Some(sym::Option | sym::Result))
                     });
                     if is_option_or_result && maybe_reinitialized_locations_is_empty {

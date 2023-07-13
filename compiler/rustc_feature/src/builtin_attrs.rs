@@ -356,10 +356,6 @@ pub const BUILTIN_ATTRIBUTES: &[BuiltinAttribute] = &[
     ungated!(recursion_limit, CrateLevel, template!(NameValueStr: "N"), FutureWarnFollowing),
     ungated!(type_length_limit, CrateLevel, template!(NameValueStr: "N"), FutureWarnFollowing),
     gated!(
-        const_eval_limit, CrateLevel, template!(NameValueStr: "N"), ErrorFollowing,
-        const_eval_limit, experimental!(const_eval_limit)
-    ),
-    gated!(
         move_size_limit, CrateLevel, template!(NameValueStr: "N"), ErrorFollowing,
         large_assignments, experimental!(move_size_limit)
     ),
@@ -709,7 +705,11 @@ pub const BUILTIN_ATTRIBUTES: &[BuiltinAttribute] = &[
         "#[rustc_allow_incoherent_impl] has to be added to all impl items of an incoherent inherent impl."
     ),
     rustc_attr!(
-        rustc_deny_explicit_impl, AttributeType::Normal, template!(Word), ErrorFollowing, @only_local: false,
+        rustc_deny_explicit_impl,
+        AttributeType::Normal,
+        template!(List: "implement_via_object = (true|false)"),
+        ErrorFollowing,
+        @only_local: true,
         "#[rustc_deny_explicit_impl] enforces that a trait can have no user-provided impls"
     ),
     rustc_attr!(
@@ -721,6 +721,12 @@ pub const BUILTIN_ATTRIBUTES: &[BuiltinAttribute] = &[
         rustc_box, AttributeType::Normal, template!(Word), ErrorFollowing,
         "#[rustc_box] allows creating boxes \
         and it is only intended to be used in `alloc`."
+    ),
+
+    rustc_attr!(
+        rustc_host, AttributeType::Normal, template!(Word), ErrorFollowing,
+        "#[rustc_host] annotates const generic parameters as the `host` effect param, \
+        and it is only intended for internal use and as a desugaring."
     ),
 
     BuiltinAttribute {
@@ -861,11 +867,11 @@ pub fn is_builtin_attr_name(name: Symbol) -> bool {
 /// Whether this builtin attribute is only used in the local crate.
 /// If so, it is not encoded in the crate metadata.
 pub fn is_builtin_only_local(name: Symbol) -> bool {
-    BUILTIN_ATTRIBUTE_MAP.get(&name).map_or(false, |attr| attr.only_local)
+    BUILTIN_ATTRIBUTE_MAP.get(&name).is_some_and(|attr| attr.only_local)
 }
 
 pub fn is_valid_for_get_attr(name: Symbol) -> bool {
-    BUILTIN_ATTRIBUTE_MAP.get(&name).map_or(false, |attr| match attr.duplicates {
+    BUILTIN_ATTRIBUTE_MAP.get(&name).is_some_and(|attr| match attr.duplicates {
         WarnFollowing | ErrorFollowing | ErrorPreceding | FutureWarnFollowing
         | FutureWarnPreceding => true,
         DuplicatesOk | WarnFollowingWordOnly => false,

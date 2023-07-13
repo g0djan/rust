@@ -31,11 +31,11 @@ pub struct SsaLocals {
 /// We often encounter MIR bodies with 1 or 2 basic blocks. In those cases, it's unnecessary to
 /// actually compute dominators, we can just compare block indices because bb0 is always the first
 /// block, and in any body all other blocks are always dominated by bb0.
-struct SmallDominators {
-    inner: Option<Dominators<BasicBlock>>,
+struct SmallDominators<'a> {
+    inner: Option<&'a Dominators<BasicBlock>>,
 }
 
-impl SmallDominators {
+impl SmallDominators<'_> {
     fn dominates(&self, first: Location, second: Location) -> bool {
         if first.block == second.block {
             first.statement_index <= second.statement_index
@@ -198,14 +198,14 @@ enum LocationExtended {
     Arg,
 }
 
-struct SsaVisitor {
-    dominators: SmallDominators,
+struct SsaVisitor<'a> {
+    dominators: SmallDominators<'a>,
     assignments: IndexVec<Local, Set1<LocationExtended>>,
     assignment_order: Vec<Local>,
     direct_uses: IndexVec<Local, u32>,
 }
 
-impl<'tcx> Visitor<'tcx> for SsaVisitor {
+impl<'tcx> Visitor<'tcx> for SsaVisitor<'_> {
     fn visit_local(&mut self, local: Local, ctxt: PlaceContext, loc: Location) {
         match ctxt {
             PlaceContext::MutatingUse(MutatingUseContext::Projection)
@@ -216,7 +216,6 @@ impl<'tcx> Visitor<'tcx> for SsaVisitor {
             PlaceContext::NonMutatingUse(
                 NonMutatingUseContext::SharedBorrow
                 | NonMutatingUseContext::ShallowBorrow
-                | NonMutatingUseContext::UniqueBorrow
                 | NonMutatingUseContext::AddressOf,
             )
             | PlaceContext::MutatingUse(_) => {
@@ -272,6 +271,14 @@ fn compute_copy_classes(ssa: &mut SsaLocals, body: &Body<'_>) {
         else { continue };
 
         let Some(rhs) = place.as_local() else { continue };
+        let local_ty = body.local_decls()[local].ty;
+        let rhs_ty = body.local_decls()[rhs].ty;
+        if local_ty != rhs_ty {
+            // FIXME(#112651): This can be removed afterwards.
+            trace!("skipped `{local:?} = {rhs:?}` due to subtyping: {local_ty} != {rhs_ty}");
+            continue;
+        }
+
         if !ssa.is_ssa(rhs) {
             continue;
         }

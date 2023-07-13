@@ -4,6 +4,7 @@
 #![feature(if_let_guard)]
 #![feature(int_roundings)]
 #![feature(let_chains)]
+#![feature(negative_impls)]
 #![feature(never_type)]
 #![feature(strict_provenance)]
 #![feature(try_blocks)]
@@ -28,6 +29,7 @@ use rustc_errors::{DiagnosticMessage, SubdiagnosticMessage};
 use rustc_fluent_macro::fluent_messages;
 use rustc_hir::def_id::CrateNum;
 use rustc_middle::dep_graph::WorkProduct;
+use rustc_middle::middle::debugger_visualizer::DebuggerVisualizerFile;
 use rustc_middle::middle::dependency_format::Dependencies;
 use rustc_middle::middle::exported_symbols::SymbolExportKind;
 use rustc_middle::query::{ExternProviders, Providers};
@@ -38,7 +40,6 @@ use rustc_session::cstore::{self, CrateSource};
 use rustc_session::utils::NativeLibKind;
 use rustc_session::Session;
 use rustc_span::symbol::Symbol;
-use rustc_span::DebuggerVisualizerFile;
 use std::collections::BTreeSet;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -47,7 +48,6 @@ pub mod back;
 pub mod base;
 pub mod codegen_attrs;
 pub mod common;
-pub mod coverageinfo;
 pub mod debuginfo;
 pub mod errors;
 pub mod glue;

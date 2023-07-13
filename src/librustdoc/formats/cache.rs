@@ -121,6 +121,11 @@ pub(crate) struct Cache {
     pub(crate) intra_doc_links: FxHashMap<ItemId, FxIndexSet<clean::ItemLink>>,
     /// Cfg that have been hidden via #![doc(cfg_hide(...))]
     pub(crate) hidden_cfg: FxHashSet<clean::cfg::Cfg>,
+
+    /// Contains the list of `DefId`s which have been inlined. It is used when generating files
+    /// to check if a stripped item should get its file generated or not: if it's inside a
+    /// `#[doc(hidden)]` item or a private one and not inlined, it shouldn't get a file.
+    pub(crate) inlined_items: DefIdSet,
 }
 
 /// This struct is used to wrap the `cache` and `tcx` in order to run `DocFolder`.
@@ -147,7 +152,7 @@ impl Cache {
 
         // Cache where all our extern crates are located
         // FIXME: this part is specific to HTML so it'd be nice to remove it from the common code
-        for &crate_num in cx.tcx.crates(()) {
+        for &crate_num in tcx.crates(()) {
             let e = ExternalCrate { crate_num };
 
             let name = e.name(tcx);
@@ -327,9 +332,8 @@ impl<'a, 'tcx> DocFolder for CacheBuilder<'a, 'tcx> {
                     // which should not be indexed. The crate-item itself is
                     // inserted later on when serializing the search-index.
                     if item.item_id.as_def_id().map_or(false, |idx| !idx.is_crate_root()) {
-                        let desc = item.doc_value().map_or_else(String::new, |x| {
-                            short_markdown_summary(x.as_str(), &item.link_names(self.cache))
-                        });
+                        let desc =
+                            short_markdown_summary(&item.doc_value(), &item.link_names(self.cache));
                         let ty = item.type_();
                         if ty != ItemType::StructField
                             || u16::from_str_radix(s.as_str(), 10).is_err()

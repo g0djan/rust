@@ -8,6 +8,8 @@
 #![feature(nonzero_ops)]
 #![feature(local_key_cell_methods)]
 #![feature(round_ties_even)]
+#![feature(os_str_bytes)]
+#![feature(lint_reasons)]
 // Configure clippy and other lints
 #![allow(
     clippy::collapsible_else_if,
@@ -43,6 +45,7 @@
 
 extern crate rustc_apfloat;
 extern crate rustc_ast;
+extern crate rustc_errors;
 #[macro_use]
 extern crate rustc_middle;
 extern crate rustc_const_eval;
@@ -52,6 +55,7 @@ extern crate rustc_index;
 extern crate rustc_session;
 extern crate rustc_span;
 extern crate rustc_target;
+extern crate either; // the one from rustc
 
 // Necessary to pull in object code as the rest of the rustc crates are shipped only as rmeta
 // files.

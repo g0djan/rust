@@ -6,10 +6,10 @@
 //! Imports are also considered items and placed into modules here, but not resolved yet.
 
 use crate::def_collector::collect_definitions;
-use crate::imports::{Import, ImportKind};
+use crate::imports::{ImportData, ImportKind};
 use crate::macros::{MacroRulesBinding, MacroRulesScope, MacroRulesScopeRef};
 use crate::Namespace::{self, MacroNS, TypeNS, ValueNS};
-use crate::{errors, BindingKey, MacroData};
+use crate::{errors, BindingKey, MacroData, NameBindingData};
 use crate::{Determinacy, ExternPreludeEntry, Finalize, Module, ModuleKind, ModuleOrUniformRoot};
 use crate::{NameBinding, NameBindingKind, ParentScope, PathResult, PerNS, ResolutionError};
 use crate::{Resolver, ResolverArenas, Segment, ToNameBinding, VisResolutionError};
@@ -31,15 +31,14 @@ use rustc_span::symbol::{kw, sym, Ident, Symbol};
 use rustc_span::Span;
 
 use std::cell::Cell;
-use std::ptr;
 
 type Res = def::Res<NodeId>;
 
 impl<'a, Id: Into<DefId>> ToNameBinding<'a>
     for (Module<'a>, ty::Visibility<Id>, Span, LocalExpnId)
 {
-    fn to_name_binding(self, arenas: &'a ResolverArenas<'a>) -> &'a NameBinding<'a> {
-        arenas.alloc_name_binding(NameBinding {
+    fn to_name_binding(self, arenas: &'a ResolverArenas<'a>) -> NameBinding<'a> {
+        arenas.alloc_name_binding(NameBindingData {
             kind: NameBindingKind::Module(self.0),
             ambiguity: None,
             vis: self.1.to_def_id(),
@@ -50,8 +49,8 @@ impl<'a, Id: Into<DefId>> ToNameBinding<'a>
 }
 
 impl<'a, Id: Into<DefId>> ToNameBinding<'a> for (Res, ty::Visibility<Id>, Span, LocalExpnId) {
-    fn to_name_binding(self, arenas: &'a ResolverArenas<'a>) -> &'a NameBinding<'a> {
-        arenas.alloc_name_binding(NameBinding {
+    fn to_name_binding(self, arenas: &'a ResolverArenas<'a>) -> NameBinding<'a> {
+        arenas.alloc_name_binding(NameBindingData {
             kind: NameBindingKind::Res(self.0),
             ambiguity: None,
             vis: self.1.to_def_id(),
@@ -71,7 +70,7 @@ impl<'a, 'tcx> Resolver<'a, 'tcx> {
         let binding = def.to_name_binding(self.arenas);
         let key = self.new_disambiguated_key(ident, ns);
         if let Err(old_binding) = self.try_define(parent, key, binding) {
-            self.report_conflict(parent, ident, ns, old_binding, &binding);
+            self.report_conflict(parent, ident, ns, old_binding, binding);
         }
     }
 
@@ -129,7 +128,7 @@ impl<'a, 'tcx> Resolver<'a, 'tcx> {
                     expn_id,
                     self.def_span(def_id),
                     // FIXME: Account for `#[no_implicit_prelude]` attributes.
-                    parent.map_or(false, |module| module.no_implicit_prelude),
+                    parent.is_some_and(|module| module.no_implicit_prelude),
                 ));
             }
         }
@@ -142,8 +141,8 @@ impl<'a, 'tcx> Resolver<'a, 'tcx> {
             Some(def_id) => self.macro_def_scope(def_id),
             None => expn_id
                 .as_local()
-                .and_then(|expn_id| self.ast_transform_scopes.get(&expn_id))
-                .unwrap_or(&self.graph_root),
+                .and_then(|expn_id| self.ast_transform_scopes.get(&expn_id).copied())
+                .unwrap_or(self.graph_root),
         }
     }
 
@@ -354,7 +353,7 @@ impl<'a, 'b, 'tcx> BuildReducedGraphVisitor<'a, 'b, 'tcx> {
         vis: ty::Visibility,
     ) {
         let current_module = self.parent_scope.module;
-        let import = self.r.arenas.alloc_import(Import {
+        let import = self.r.arenas.alloc_import(ImportData {
             kind,
             parent_scope: self.parent_scope,
             module_path,
@@ -378,7 +377,7 @@ impl<'a, 'b, 'tcx> BuildReducedGraphVisitor<'a, 'b, 'tcx> {
                     if !type_ns_only || ns == TypeNS {
                         let key = BindingKey::new(target, ns);
                         let mut resolution = this.resolution(current_module, key).borrow_mut();
-                        resolution.add_single_import(import);
+                        resolution.single_imports.insert(import);
                     }
                 });
             }
@@ -848,7 +847,7 @@ impl<'a, 'b, 'tcx> BuildReducedGraphVisitor<'a, 'b, 'tcx> {
             (used, Some(ModuleOrUniformRoot::Module(module)), binding)
         })
         .unwrap_or((true, None, self.r.dummy_binding));
-        let import = self.r.arenas.alloc_import(Import {
+        let import = self.r.arenas.alloc_import(ImportData {
             kind: ImportKind::ExternCrate { source: orig_name, target: ident, id: item.id },
             root_id: item.id,
             parent_scope: self.parent_scope,
@@ -864,7 +863,7 @@ impl<'a, 'b, 'tcx> BuildReducedGraphVisitor<'a, 'b, 'tcx> {
         });
         self.r.potentially_unused_imports.push(import);
         let imported_binding = self.r.import(binding, import);
-        if ptr::eq(parent, self.r.graph_root) {
+        if parent == self.r.graph_root {
             if let Some(entry) = self.r.extern_prelude.get(&ident.normalize_to_macros_2_0()) {
                 if expansion != LocalExpnId::ROOT
                     && orig_name.is_some()
@@ -873,6 +872,11 @@ impl<'a, 'b, 'tcx> BuildReducedGraphVisitor<'a, 'b, 'tcx> {
                     let msg = "macro-expanded `extern crate` items cannot \
                                        shadow names passed with `--extern`";
                     self.r.tcx.sess.span_err(item.span, msg);
+                    // `return` is intended to discard this binding because it's an
+                    // unregistered ambiguity error which would result in a panic
+                    // caused by inconsistency `path_res`
+                    // more details: https://github.com/rust-lang/rust/pull/111761
+                    return;
                 }
             }
             let entry = self.r.extern_prelude.entry(ident.normalize_to_macros_2_0()).or_insert(
@@ -945,7 +949,6 @@ impl<'a, 'b, 'tcx> BuildReducedGraphVisitor<'a, 'b, 'tcx> {
                 | DefKind::TyAlias
                 | DefKind::ForeignTy
                 | DefKind::OpaqueTy
-                | DefKind::ImplTraitPlaceholder
                 | DefKind::TraitAlias
                 | DefKind::AssocTy,
                 _,
@@ -991,7 +994,7 @@ impl<'a, 'b, 'tcx> BuildReducedGraphVisitor<'a, 'b, 'tcx> {
     fn add_macro_use_binding(
         &mut self,
         name: Symbol,
-        binding: &'a NameBinding<'a>,
+        binding: NameBinding<'a>,
         span: Span,
         allow_shadowing: bool,
     ) {
@@ -1053,7 +1056,7 @@ impl<'a, 'b, 'tcx> BuildReducedGraphVisitor<'a, 'b, 'tcx> {
         }
 
         let macro_use_import = |this: &Self, span| {
-            this.r.arenas.alloc_import(Import {
+            this.r.arenas.alloc_import(ImportData {
                 kind: ImportKind::MacroUse,
                 root_id: item.id,
                 parent_scope: this.parent_scope,
@@ -1223,7 +1226,7 @@ impl<'a, 'b, 'tcx> BuildReducedGraphVisitor<'a, 'b, 'tcx> {
             self.r.set_binding_parent_module(binding, parent_scope.module);
             self.r.all_macro_rules.insert(ident.name, res);
             if is_macro_export {
-                let import = self.r.arenas.alloc_import(Import {
+                let import = self.r.arenas.alloc_import(ImportData {
                     kind: ImportKind::MacroExport,
                     root_id: item.id,
                     parent_scope: self.parent_scope,
