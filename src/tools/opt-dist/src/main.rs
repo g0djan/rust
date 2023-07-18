@@ -128,7 +128,6 @@ fn main() -> anyhow::Result<()> {
         .parse_default_env()
         .init();
 
-
     let mut build_args: Vec<String> = std::env::args().skip(1).collect();
     log::info!("Running optimized build pipeline with args `{}`", build_args.join(" "));
     log::info!("Environment values\n{}", format_env_variables());
